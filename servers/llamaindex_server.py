@@ -46,11 +46,40 @@ try:
     LLAMAINDEX_AVAILABLE = True
 except ImportError:
     LLAMAINDEX_AVAILABLE = False
-    logger.warning("LlamaIndex not installed. Install with: pip install llama-index chromadb sentence-transformers")
+    logger.warning("LlamaIndex not installed. Install with: pip install llama-index chromadb")
+
+# Try fastembed (lightweight, no PyTorch needed — 68MB vs 469MB)
+FASTEMBED_AVAILABLE = False
+try:
+    from fastembed import TextEmbedding as FastTextEmbedding
+    FASTEMBED_AVAILABLE = True
+except ImportError:
+    pass
 
 # Configuration
-CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", "./chroma_db")
-EMBED_MODEL = os.getenv("LLAMAINDEX_EMBED_MODEL", "dmis-lab/biobert-base-cased-v1.2")
+# On HF Spaces, copy pre-loaded chroma_db to writable location if needed
+_default_chroma_path = "./chroma_db"
+_hf_chroma_path = "/tmp/chroma_db"
+
+def _resolve_chroma_path():
+    """Resolve ChromaDB path, copying pre-loaded data to writable location on HF Spaces."""
+    configured = os.getenv("CHROMA_DB_PATH", "")
+    if configured:
+        return configured
+    # If running on HF Spaces (or ./chroma_db is not writable), copy to /tmp
+    source = Path(_default_chroma_path)
+    if source.exists() and os.environ.get("SPACE_ID"):
+        dest = Path(_hf_chroma_path)
+        if not dest.exists():
+            import shutil
+            shutil.copytree(str(source), str(dest))
+            logger.info(f"Copied pre-loaded chroma_db to {dest}")
+        return str(dest)
+    return _default_chroma_path
+
+CHROMA_DB_PATH = _resolve_chroma_path()
+EMBED_MODEL = os.getenv("LLAMAINDEX_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+USE_FASTEMBED = os.getenv("USE_FASTEMBED", "true").lower() == "true"
 CHUNK_SIZE = int(os.getenv("LLAMAINDEX_CHUNK_SIZE", "1024"))
 CHUNK_OVERLAP = int(os.getenv("LLAMAINDEX_CHUNK_OVERLAP", "200"))
 
@@ -59,6 +88,37 @@ research_index = None
 chroma_client = None
 collection = None
 papers_metadata = {}  # Store paper metadata separately
+
+
+if LLAMAINDEX_AVAILABLE:
+    from llama_index.core.embeddings import BaseEmbedding
+
+    class FastEmbedEmbedding(BaseEmbedding):
+        """LlamaIndex-compatible wrapper for fastembed (no PyTorch, 6x smaller)."""
+
+        model_name: str = "BAAI/bge-small-en-v1.5"
+
+        def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5", **kwargs):
+            super().__init__(model_name=model_name, **kwargs)
+            self._ft_model = None
+
+        def _ensure_model(self):
+            if self._ft_model is None:
+                self._ft_model = FastTextEmbedding(self.model_name)
+
+        def _get_text_embedding(self, text: str) -> list:
+            self._ensure_model()
+            return list(self._ft_model.embed([text]))[0].tolist()
+
+        def _get_text_embeddings(self, texts: list) -> list:
+            self._ensure_model()
+            return [e.tolist() for e in self._ft_model.embed(texts)]
+
+        def _get_query_embedding(self, query: str) -> list:
+            return self._get_text_embedding(query)
+
+        async def _aget_query_embedding(self, query: str) -> list:
+            return self._get_text_embedding(query)
 
 
 class ResearchMemoryManager:
@@ -90,19 +150,24 @@ class ResearchMemoryManager:
                 self.collection = self.chroma_client.create_collection("als_research")
                 logger.info("Created new ChromaDB collection")
 
-            # Initialize embedding model - prefer biomedical models
-            try:
-                embed_model = HuggingFaceEmbedding(
-                    model_name=EMBED_MODEL,
-                    cache_folder="./embed_cache"
-                )
-                logger.info(f"Using embedding model: {EMBED_MODEL}")
-            except Exception as e:
-                logger.warning(f"Failed to load {EMBED_MODEL}, falling back to default")
-                embed_model = HuggingFaceEmbedding(
-                    model_name="sentence-transformers/all-MiniLM-L6-v2",
-                    cache_folder="./embed_cache"
-                )
+            # Initialize embedding model
+            # Prefer fastembed (68MB, no PyTorch) over HuggingFace (469MB, needs PyTorch)
+            if USE_FASTEMBED and FASTEMBED_AVAILABLE:
+                embed_model = FastEmbedEmbedding(model_name=EMBED_MODEL)
+                logger.info(f"Using fastembed model: {EMBED_MODEL} (lightweight, no PyTorch)")
+            else:
+                try:
+                    embed_model = HuggingFaceEmbedding(
+                        model_name=EMBED_MODEL,
+                        cache_folder="./embed_cache"
+                    )
+                    logger.info(f"Using HuggingFace embedding model: {EMBED_MODEL}")
+                except Exception as e:
+                    logger.warning(f"Failed to load {EMBED_MODEL}, falling back to default")
+                    embed_model = HuggingFaceEmbedding(
+                        model_name="sentence-transformers/all-MiniLM-L6-v2",
+                        cache_folder="./embed_cache"
+                    )
 
             # Configure settings
             Settings.embed_model = embed_model

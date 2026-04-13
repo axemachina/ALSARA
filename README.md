@@ -194,7 +194,7 @@ cd als-research-agent
 2. Create virtual environment
 
 ```bash
-python3.12 -m venv venv
+python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
 
@@ -237,7 +237,7 @@ python als_agent_app.py
 or
 
 ```bash
-./venv/bin/python3.12 als_agent_app.py 2>&1
+./venv/bin/python3 als_agent_app.py 2>&1
 ```
 
 The app will launch at http://localhost:7860

@@ -222,16 +222,11 @@ async def search_als_trials(
             param_count += 1
 
         if phase:
-            phase_map = {
-                'PHASE_1': 'Phase 1',
-                'PHASE_2': 'Phase 2',
-                'PHASE_3': 'Phase 3',
-                'PHASE_4': 'Phase 4',
-                'EARLY_PHASE_1': 'Early Phase 1'
-            }
-            mapped_phase = phase_map.get(phase.upper(), phase)
-            conditions.append(f"s.phase = ${param_count}")
-            params.append(mapped_phase)
+            # Normalize phase input to match DB values (PHASE1, PHASE2, PHASE3, etc.)
+            normalized = phase.upper().replace(' ', '').replace('_', '')
+            # Also match combined phases like PHASE1/PHASE2, PHASE2/PHASE3
+            conditions.append(f"UPPER(REPLACE(s.phase, '/', '/')) LIKE ${param_count}")
+            params.append(f"%{normalized}%")
             param_count += 1
 
         if intervention:
@@ -241,9 +236,10 @@ async def search_als_trials(
 
         if location:
             base_query = base_query.replace("LEFT JOIN facilities f", "INNER JOIN facilities f")
-            conditions.append(f"(LOWER(f.country) LIKE ${param_count} OR LOWER(f.state) LIKE ${param_count})")
+            conditions.append(f"(LOWER(f.country) LIKE ${param_count} OR LOWER(f.state) LIKE ${param_count + 1})")
             params.append(f"%{location.lower()}%")
-            param_count += 1
+            params.append(f"%{location.lower()}%")
+            param_count += 2
 
         # Add conditions to query
         if conditions:
@@ -342,7 +338,7 @@ async def get_trial_details(nct_id: str) -> str:
             s.start_date,
             s.primary_completion_date,
             s.completion_date,
-            s.first_posted_date,
+            s.study_first_posted_date as first_posted_date,
             s.last_update_posted_date,
             s.why_stopped,
             b.description as brief_summary,
@@ -374,7 +370,7 @@ async def get_trial_details(nct_id: str) -> str:
 
         # Get outcomes
         outcomes_query = """
-        SELECT outcome_type, measure, time_frame, description
+        SELECT outcome_type, title as measure, time_frame, description
         FROM outcomes
         WHERE nct_id = $1
         ORDER BY outcome_type, id
@@ -457,6 +453,356 @@ async def get_trial_details(nct_id: str) -> str:
             "error": "Database query failed",
             "message": str(e)
         })
+
+@mcp.tool()
+async def find_trials_near_me(
+    zip_code: Optional[str] = None,
+    city: Optional[str] = None,
+    state: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    radius_miles: int = 200,
+    status: str = "RECRUITING",
+    subtype: Optional[str] = None,
+    max_results: int = 15,
+) -> str:
+    """Find ALS clinical trials near a location. Provide EITHER zip_code, city+state, OR latitude+longitude.
+
+    Args:
+        zip_code: US ZIP code (e.g., '10001' for NYC). Preferred for US locations.
+        city: City name (e.g., 'Boston'). Use with state for best results.
+        state: US state name (e.g., 'Massachusetts') or country for international.
+        latitude: Latitude coordinate (e.g., 40.7128 for NYC).
+        longitude: Longitude coordinate (e.g., -74.0060 for NYC).
+        radius_miles: Search radius in miles (default: 200, max: 500). Use 300+ for European countries.
+        status: Trial status filter (RECRUITING, ACTIVE_NOT_RECRUITING, COMPLETED).
+        subtype: ALS subtype filter — one of: SOD1, C9orf72, FUS, TDP-43, bulbar, limb, familial, sporadic.
+        max_results: Maximum results (default: 15).
+    """
+    if not (ASYNCPG_AVAILABLE or POSTGRES_AVAILABLE):
+        return json.dumps({"error": "Database not available"})
+
+    radius_miles = min(radius_miles, 500)
+
+    # Resolve location to coordinates
+    lat, lng = None, None
+    location_label = ""
+
+    if latitude is not None and longitude is not None:
+        lat, lng = latitude, longitude
+        location_label = f"({lat:.2f}, {lng:.2f})"
+    elif zip_code or (city and state):
+        # Look up coordinates from the facilities table itself
+        if zip_code:
+            lookup_query = """
+                SELECT latitude, longitude, city, state
+                FROM ctgov.facilities
+                WHERE zip LIKE $1 AND latitude IS NOT NULL
+                LIMIT 1
+            """
+            rows = await execute_query(lookup_query, (f"{zip_code}%",))
+            location_label = f"ZIP {zip_code}"
+        else:
+            # Try city+state first, then city-only fallback (state values are inconsistent internationally)
+            lookup_query = """
+                SELECT latitude, longitude, city, state
+                FROM ctgov.facilities
+                WHERE LOWER(city) = $1 AND LOWER(state) = $2 AND latitude IS NOT NULL
+                LIMIT 1
+            """
+            rows = await execute_query(lookup_query, (city.lower(), state.lower()))
+            location_label = f"{city}, {state}"
+
+            if not rows:
+                # Fallback: city only (handles international locations with non-standard state values)
+                lookup_query = """
+                    SELECT latitude, longitude, city, state, country
+                    FROM ctgov.facilities
+                    WHERE LOWER(city) = $1 AND latitude IS NOT NULL
+                    LIMIT 1
+                """
+                rows = await execute_query(lookup_query, (city.lower(),))
+
+        if rows:
+            lat = float(rows[0]['latitude'])
+            lng = float(rows[0]['longitude'])
+            location_label = f"{rows[0]['city']}, {rows[0].get('state') or rows[0].get('country', '')}"
+        else:
+            return json.dumps({
+                "error": f"Could not find coordinates for {location_label}. Try providing latitude/longitude directly, or use a nearby major city."
+            })
+    elif city:
+        # City without state — try best match
+        lookup_query = """
+            SELECT latitude, longitude, city, state, country
+            FROM ctgov.facilities
+            WHERE LOWER(city) = $1 AND latitude IS NOT NULL
+            LIMIT 1
+        """
+        rows = await execute_query(lookup_query, (city.lower(),))
+        if rows:
+            lat = float(rows[0]['latitude'])
+            lng = float(rows[0]['longitude'])
+            location_label = f"{rows[0]['city']}, {rows[0].get('state') or rows[0].get('country', '')}"
+        else:
+            return json.dumps({"error": f"Could not find coordinates for '{city}'. Try adding state or country."})
+    else:
+        return json.dumps({"error": "Please provide a location: zip_code, city+state, or latitude+longitude."})
+
+    logger.info(f"Searching ALS trials within {radius_miles} miles of {location_label} ({lat}, {lng})")
+
+    # Build subtype condition
+    subtype_condition = ""
+    subtype_params = []
+    param_offset = 4  # $1=lat, $2=lng, $3=radius, $4 onward
+
+    if subtype:
+        subtype_lower = subtype.lower().strip()
+        subtype_map = {
+            "sod1": ["sod1", "superoxide dismutase"],
+            "c9orf72": ["c9orf72", "c9", "chromosome 9"],
+            "fus": ["fus", "fused in sarcoma"],
+            "tdp-43": ["tdp-43", "tdp43", "tardbp"],
+            "bulbar": ["bulbar"],
+            "limb": ["limb-onset", "limb onset", "spinal onset"],
+            "familial": ["familial", "fals", "genetic"],
+            "sporadic": ["sporadic", "sals"],
+        }
+        terms = subtype_map.get(subtype_lower, [subtype_lower])
+        like_clauses = []
+        for term in terms:
+            like_clauses.append(f"LOWER(s.brief_title) LIKE ${param_offset}")
+            subtype_params.append(f"%{term}%")
+            param_offset += 1
+            like_clauses.append(f"LOWER(s.official_title) LIKE ${param_offset}")
+            subtype_params.append(f"%{term}%")
+            param_offset += 1
+            like_clauses.append(f"LOWER(COALESCE(i.name, '')) LIKE ${param_offset}")
+            subtype_params.append(f"%{term}%")
+            param_offset += 1
+        subtype_condition = f"AND ({' OR '.join(like_clauses)})"
+
+    # Status condition
+    status_condition = ""
+    if status:
+        status_condition = f"AND UPPER(s.overall_status) = ${param_offset}"
+        subtype_params.append(status.upper())
+        param_offset += 1
+
+    query = f"""
+        SELECT t.*, iv.interventions FROM (
+            SELECT DISTINCT ON (s.nct_id)
+                s.nct_id, s.brief_title, s.overall_status, s.phase,
+                s.enrollment, s.start_date,
+                f.name as facility, f.city, f.state, f.zip, f.country, f.status as site_status,
+                (3959 * acos(
+                    LEAST(1.0, GREATEST(-1.0,
+                        cos(radians($1)) * cos(radians(f.latitude)) *
+                        cos(radians(f.longitude) - radians($2)) +
+                        sin(radians($1)) * sin(radians(f.latitude))
+                    ))
+                )) as distance_miles
+            FROM ctgov.facilities f
+            JOIN ctgov.studies s ON f.nct_id = s.nct_id
+            JOIN ctgov.conditions c ON s.nct_id = c.nct_id
+            LEFT JOIN ctgov.interventions i ON s.nct_id = i.nct_id
+            WHERE f.latitude IS NOT NULL AND f.longitude IS NOT NULL
+            AND (
+                LOWER(c.name) LIKE '%amyotrophic lateral sclerosis%' OR
+                LOWER(c.name) LIKE '%motor neuron disease%'
+            )
+            AND (3959 * acos(
+                LEAST(1.0, GREATEST(-1.0,
+                    cos(radians($1)) * cos(radians(f.latitude)) *
+                    cos(radians(f.longitude) - radians($2)) +
+                    sin(radians($1)) * sin(radians(f.latitude))
+                ))
+            )) < $3
+            {subtype_condition}
+            {status_condition}
+            ORDER BY s.nct_id, distance_miles
+        ) t
+        LEFT JOIN LATERAL (
+            SELECT STRING_AGG(DISTINCT name, ', ') as interventions
+            FROM ctgov.interventions WHERE nct_id = t.nct_id
+        ) iv ON true
+    """
+
+    params = (lat, lng, float(radius_miles), *subtype_params)
+
+    try:
+        results = await execute_query(query, params)
+
+        # Sort by distance and limit
+        results.sort(key=lambda r: float(r['distance_miles']))
+        results = results[:max_results]
+
+        if not results:
+            hint = ""
+            if radius_miles < 200:
+                hint = f" Try increasing radius_miles (currently {radius_miles})."
+            if subtype:
+                hint += f" Try removing the '{subtype}' subtype filter for broader results."
+            return json.dumps({
+                "message": f"No recruiting ALS trials found within {radius_miles} miles of {location_label}.{hint}",
+                "total": 0, "trials": []
+            })
+
+        trials = []
+        for r in results:
+            trials.append({
+                "nct_id": r['nct_id'],
+                "title": r['brief_title'],
+                "distance_miles": round(float(r['distance_miles']), 1),
+                "facility": r['facility'],
+                "location": f"{r['city']}, {r['state'] or ''} {r['zip'] or ''}".strip(),
+                "country": r['country'],
+                "site_status": r['site_status'],
+                "status": r['overall_status'],
+                "phase": r['phase'],
+                "interventions": r['interventions'],
+                "url": f"https://clinicaltrials.gov/study/{r['nct_id']}"
+            })
+
+        return json.dumps({
+            "message": f"Found {len(trials)} ALS trials within {radius_miles} miles of {location_label}",
+            "search_center": location_label,
+            "radius_miles": radius_miles,
+            "total": len(trials),
+            "trials": trials
+        }, indent=2)
+
+    except Exception as e:
+        logger.error(f"Proximity search failed: {e}")
+        return json.dumps({"error": "Search failed", "message": str(e)})
+
+
+@mcp.tool()
+async def check_new_als_trials(
+    days_back: int = 30,
+    subtype: Optional[str] = None,
+    status: str = "RECRUITING",
+) -> str:
+    """Check for ALS trials posted or updated recently. Use this to monitor for new developments.
+
+    Args:
+        days_back: How many days back to check (default: 30, max: 365).
+        subtype: ALS subtype filter — one of: SOD1, C9orf72, FUS, TDP-43, bulbar, limb, familial, sporadic.
+        status: Trial status filter (default: RECRUITING). Use 'ANY' for all statuses.
+    """
+    if not (ASYNCPG_AVAILABLE or POSTGRES_AVAILABLE):
+        return json.dumps({"error": "Database not available"})
+
+    days_back = min(days_back, 365)
+    cutoff_date = (datetime.now() - timedelta(days=days_back)).date()
+
+    logger.info(f"Checking for new ALS trials since {cutoff_date}, subtype={subtype}, status={status}")
+
+    # Build subtype condition
+    subtype_condition = ""
+    params = [cutoff_date]
+    param_count = 2
+
+    if subtype:
+        subtype_lower = subtype.lower().strip()
+        subtype_map = {
+            "sod1": ["sod1", "superoxide dismutase"],
+            "c9orf72": ["c9orf72", "c9", "chromosome 9"],
+            "fus": ["fus", "fused in sarcoma"],
+            "tdp-43": ["tdp-43", "tdp43", "tardbp"],
+            "bulbar": ["bulbar"],
+            "limb": ["limb-onset", "limb onset", "spinal onset"],
+            "familial": ["familial", "fals", "genetic"],
+            "sporadic": ["sporadic", "sals"],
+        }
+        terms = subtype_map.get(subtype_lower, [subtype_lower])
+        like_clauses = []
+        for term in terms:
+            like_clauses.append(f"LOWER(s.brief_title) LIKE ${param_count}")
+            params.append(f"%{term}%")
+            param_count += 1
+            like_clauses.append(f"LOWER(s.official_title) LIKE ${param_count}")
+            params.append(f"%{term}%")
+            param_count += 1
+        subtype_condition = f"AND ({' OR '.join(like_clauses)})"
+
+    status_condition = ""
+    if status and status.upper() != "ANY":
+        status_condition = f"AND UPPER(s.overall_status) = ${param_count}"
+        params.append(status.upper())
+        param_count += 1
+
+    query = f"""
+        SELECT
+            s.nct_id, s.brief_title, s.overall_status, s.phase,
+            s.enrollment, s.start_date,
+            s.study_first_posted_date as first_posted_date, s.last_update_posted_date,
+            STRING_AGG(DISTINCT i.name, ', ') as interventions,
+            STRING_AGG(DISTINCT c.name, ', ') as conditions,
+            COUNT(DISTINCT f.id) as num_locations
+        FROM ctgov.studies s
+        JOIN ctgov.conditions c ON s.nct_id = c.nct_id
+        LEFT JOIN ctgov.interventions i ON s.nct_id = i.nct_id
+        LEFT JOIN ctgov.facilities f ON s.nct_id = f.nct_id
+        WHERE (
+            LOWER(c.name) LIKE '%amyotrophic lateral sclerosis%' OR
+            LOWER(c.name) LIKE '%motor neuron disease%'
+        )
+        AND (s.study_first_posted_date >= $1 OR s.last_update_posted_date >= $1)
+        {subtype_condition}
+        {status_condition}
+        GROUP BY s.nct_id, s.brief_title, s.overall_status, s.phase,
+                 s.enrollment, s.start_date, s.study_first_posted_date, s.last_update_posted_date
+        ORDER BY GREATEST(s.study_first_posted_date, s.last_update_posted_date) DESC NULLS LAST
+
+        LIMIT 25
+    """
+
+    try:
+        results = await execute_query(query, tuple(params))
+
+        if not results:
+            return json.dumps({
+                "message": f"No new or updated ALS trials in the last {days_back} days.",
+                "period": f"Since {cutoff_date}",
+                "total": 0, "trials": []
+            })
+
+        # Separate newly posted vs updated
+        new_trials = []
+        updated_trials = []
+        for r in results:
+            trial = {
+                "nct_id": r['nct_id'],
+                "title": r['brief_title'],
+                "status": r['overall_status'],
+                "phase": r['phase'],
+                "enrollment": r['enrollment'],
+                "interventions": r['interventions'],
+                "num_locations": r['num_locations'],
+                "first_posted": str(r['first_posted_date']) if r['first_posted_date'] else None,
+                "last_updated": str(r['last_update_posted_date']) if r['last_update_posted_date'] else None,
+                "url": f"https://clinicaltrials.gov/study/{r['nct_id']}"
+            }
+            if r['first_posted_date'] and r['first_posted_date'] >= cutoff_date:
+                new_trials.append(trial)
+            else:
+                updated_trials.append(trial)
+
+        return json.dumps({
+            "message": f"Found {len(new_trials)} new and {len(updated_trials)} updated ALS trials since {cutoff_date}",
+            "period": f"Last {days_back} days (since {cutoff_date})",
+            "subtype_filter": subtype,
+            "new_trials": new_trials,
+            "updated_trials": updated_trials,
+            "total_new": len(new_trials),
+            "total_updated": len(updated_trials),
+        }, indent=2)
+
+    except Exception as e:
+        logger.error(f"New trials check failed: {e}")
+        return json.dumps({"error": "Search failed", "message": str(e)})
+
 
 # Cleanup on shutdown
 # Note: FastMCP doesn't have a built-in shutdown handler

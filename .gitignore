@@ -38,11 +38,10 @@ venv.bak/
 .venv/
 
 # ── Databases & Vector Stores ───────────────────────────────────────────────
-chroma_db/
+# chroma_db/ is committed — contains pre-loaded ALS trial + supplement data
 embed_cache/
 *.db
 *.sqlite
-*.sqlite3
 
 # ── Logs ────────────────────────────────────────────────────────────────────
 *.log
