@@ -249,8 +249,8 @@ logger.info(f"Using model: {ANTHROPIC_MODEL}")
 
 # Configuration for max tokens in responses
 # Set MAX_RESPONSE_TOKENS in .env to control response length
-# Claude 3.5 Sonnet supports up to 8192 tokens
-MAX_RESPONSE_TOKENS = min(int(os.getenv("MAX_RESPONSE_TOKENS") or "8192"), 8192)
+# Claude Sonnet 4.5 supports up to 16384 output tokens
+MAX_RESPONSE_TOKENS = min(int(os.getenv("MAX_RESPONSE_TOKENS") or "16384"), 16384)
 logger.info(f"Max response tokens set to: {MAX_RESPONSE_TOKENS}")
 
 # Global smart cache (24 hour TTL for research queries)
@@ -263,6 +263,31 @@ tool_cache = SimpleCache(ttl=3600)
 _cached_tools = None
 _tools_cache_time = None
 TOOLS_CACHE_TTL = 86400  # 24 hour cache for tool definitions (tools rarely change)
+
+# Lazy-loading state for LlamaIndex RAG server
+_llamaindex_initialized = False
+_llamaindex_initializing = False
+
+async def _ensure_llamaindex_server():
+    """Lazy-load the LlamaIndex RAG server on first use (saves ~27s startup)"""
+    global _llamaindex_initialized, _llamaindex_initializing, _cached_tools, _tools_cache_time
+    if _llamaindex_initialized or _llamaindex_initializing:
+        return
+    _llamaindex_initializing = True
+    try:
+        script_dir = Path(__file__).parent.resolve()
+        server_path = script_dir / "servers" / "llamaindex_server.py"
+        logger.info("📚 Lazy-loading LlamaIndex RAG server (first semantic search)...")
+        await mcp_manager.add_server("llamaindex", str(server_path))
+        _llamaindex_initialized = True
+        # Invalidate tool cache so new tools are discovered
+        _cached_tools = None
+        _tools_cache_time = None
+        logger.info("✓ LlamaIndex RAG server loaded successfully")
+    except Exception as e:
+        logger.error(f"Failed to lazy-load LlamaIndex server: {e}")
+    finally:
+        _llamaindex_initializing = False
 
 async def setup_mcp_servers() -> MCPClientManager:
     """Initialize all MCP servers using custom client"""
@@ -286,23 +311,23 @@ async def setup_mcp_servers() -> MCPClientManager:
         "aact": servers_dir / "aact_server.py",  # PRIMARY: AACT database for comprehensive clinical trials data
         "trials_links": servers_dir / "clinicaltrials_links.py",  # FALLBACK: Direct links and known ALS trials
         "fetch": servers_dir / "fetch_server.py",
-        "elevenlabs": servers_dir / "elevenlabs_server.py",  # Voice capabilities for accessibility
+        # "elevenlabs": servers_dir / "elevenlabs_server.py",  # Voice capabilities for accessibility (disabled)
     }
 
-    # bioRxiv temporarily disabled - commenting out to hide from users
-    # enable_biorxiv = os.getenv("ENABLE_BIORXIV", "true").lower() == "true"
-    # if enable_biorxiv:
-    #     servers["biorxiv"] = servers_dir / "biorxiv_server.py"
-    # else:
-    #     logger.info("⚠️ bioRxiv/medRxiv disabled for faster searches (set ENABLE_BIORXIV=true to enable)")
+    # bioRxiv preprint search (web scraping approach — relevance-ranked keyword search)
+    enable_biorxiv = os.getenv("ENABLE_BIORXIV", "false").lower() == "true"
+    if enable_biorxiv:
+        servers["biorxiv"] = servers_dir / "biorxiv_server.py"
+        logger.info("📄 bioRxiv preprint search enabled")
+    else:
+        logger.info("📄 bioRxiv disabled (set ENABLE_BIORXIV=true to enable)")
 
-    # Conditionally add LlamaIndex RAG based on environment variable
+    # LlamaIndex RAG is lazy-loaded on first semantic_search call (saves ~27s startup)
     enable_rag = os.getenv("ENABLE_RAG", "false").lower() == "true"
     if enable_rag:
-        logger.info("📚 RAG/LlamaIndex enabled (will add ~10s to startup for semantic search)")
-        servers["llamaindex"] = servers_dir / "llamaindex_server.py"
+        logger.info("📚 RAG/LlamaIndex enabled (lazy-loaded on first use)")
     else:
-        logger.info("🚀 RAG/LlamaIndex disabled for faster startup (set ENABLE_RAG=true to enable)")
+        logger.info("🚀 RAG/LlamaIndex disabled (set ENABLE_RAG=true to enable)")
 
     # Parallelize server initialization for faster startup
     async def init_server(name: str, script_path: Path):
@@ -389,6 +414,19 @@ async def get_all_tools() -> List[Dict[str, Any]]:
                 "input_schema": tool.get('inputSchema', {})
             })
 
+    # If RAG is enabled but llamaindex not yet loaded, add stub tool definitions
+    # so the LLM knows they exist and can request them (triggers lazy-load on call)
+    enable_rag = os.getenv("ENABLE_RAG", "false").lower() == "true"
+    if enable_rag and not _llamaindex_initialized:
+        llamaindex_tool_names = [name for name in [t["name"] for t in all_tools] if name.startswith("llamaindex__")]
+        if not llamaindex_tool_names:
+            all_tools.extend([
+                {"name": "llamaindex__semantic_search", "description": "Search persistent research memory using AI-powered semantic matching", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]}},
+                {"name": "llamaindex__index_paper", "description": "Save a paper to persistent memory for future retrieval", "input_schema": {"type": "object", "properties": {"title": {"type": "string"}, "abstract": {"type": "string"}, "authors": {"type": "string"}, "doi": {"type": "string"}, "year": {"type": "string"}, "url": {"type": "string"}, "finding": {"type": "string"}}, "required": ["title"]}},
+                {"name": "llamaindex__list_indexed_papers", "description": "List all papers currently in memory", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "llamaindex__get_research_connections", "description": "Find papers in memory related to a given title", "input_schema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}},
+            ])
+
     # Update cache
     _cached_tools = all_tools
     _tools_cache_time = time.time()
@@ -398,6 +436,10 @@ async def get_all_tools() -> List[Dict[str, Any]]:
 
 async def call_mcp_tool(tool_name: str, arguments: Dict[str, Any], max_retries: int = 3) -> str:
     """Execute an MCP tool call with caching, rate limiting, retry logic, and error handling"""
+
+    # Lazy-load LlamaIndex server on first llamaindex tool call
+    if tool_name.startswith("llamaindex__") and not _llamaindex_initialized:
+        await _ensure_llamaindex_server()
 
     # Check cache first (no retries needed for cached results)
     cached_result = tool_cache.get(tool_name, arguments)
@@ -512,6 +554,65 @@ def filter_internal_tags(text: str) -> str:
 
     return text.strip()
 
+def compress_messages_for_synthesis(messages: List[Dict], keep_last_n: int = 2) -> List[Dict]:
+    """Compress older tool results in message history to reduce token usage.
+
+    Keeps the system prompt, user query, and the last N message pairs intact.
+    Truncates tool result content in older messages to summaries.
+    """
+    if len(messages) <= 4:  # system + user + assistant + tool_results = nothing to compress
+        return messages
+
+    compressed = []
+    # Keep system prompt and original user query
+    compressed.append(messages[0])  # system
+    compressed.append(messages[1])  # first user message (may include history)
+
+    # Find where the "keep" boundary is — keep the last keep_last_n*2 messages intact
+    keep_from = max(2, len(messages) - keep_last_n * 2)
+
+    for i in range(2, len(messages)):
+        msg = messages[i]
+        if i < keep_from:
+            # Compress this message
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
+                # This is a tool_results message — truncate each result
+                compressed_content = []
+                for item in msg["content"]:
+                    if isinstance(item, dict) and item.get("type") == "tool_result":
+                        content = item.get("content", "")
+                        if isinstance(content, str) and len(content) > 500:
+                            # Keep first 500 chars as summary
+                            compressed_content.append({
+                                **item,
+                                "content": content[:500] + "\n[... truncated for context efficiency ...]"
+                            })
+                        else:
+                            compressed_content.append(item)
+                    else:
+                        compressed_content.append(item)
+                compressed.append({**msg, "content": compressed_content})
+            elif msg.get("role") == "assistant" and isinstance(msg.get("content"), list):
+                # Assistant message with tool_use blocks — keep tool_use, truncate text
+                compressed_content = []
+                for item in msg["content"]:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text = item.get("text", "")
+                        if len(text) > 300:
+                            compressed_content.append({**item, "text": text[:300] + "\n[... truncated ...]"})
+                        else:
+                            compressed_content.append(item)
+                    else:
+                        compressed_content.append(item)  # Keep tool_use blocks intact
+                compressed.append({**msg, "content": compressed_content})
+            else:
+                compressed.append(msg)
+        else:
+            # Keep recent messages intact
+            compressed.append(msg)
+
+    return compressed
+
 def is_complex_query(message: str) -> bool:
     """Detect complex queries that might need more iterations"""
     complex_indicators = [
@@ -583,249 +684,69 @@ async def als_research_agent(message: str, history: Optional[List[Dict[str, Any]
             logger.info(f"Truncating conversation history from {len(history)} to {MAX_CONVERSATION_LENGTH} messages")
             history = history[-MAX_CONVERSATION_LENGTH:]
 
-        # System prompt
-        base_prompt = """You are ALSARA, an expert ALS (Amyotrophic Lateral Sclerosis) research assistant with agentic capabilities for planning, execution, and reflection.
-
-CRITICAL CONTEXT: ALL queries should be interpreted in the context of ALS research unless explicitly stated otherwise.
-
-MANDATORY SEARCH QUERY RULES:
-1. ALWAYS include "ALS" or "amyotrophic lateral sclerosis" in EVERY search query
-2. If the user's query doesn't mention ALS, ADD IT to your search terms
-3. This prevents irrelevant results from other conditions
-
-Examples:
-- User: "genotyping for gene targeted treatments" → Search: "genotyping ALS gene targeted treatments"
-- User: "psilocybin clinical trials" → Search: "psilocybin ALS clinical trials"
-- User: "stem cell therapy" → Search: "stem cell therapy ALS"
-- User: "gene therapy trials" → Search: "gene therapy ALS trials"
-
-Your capabilities:
-- Search PubMed for peer-reviewed research papers
-- Find active clinical trials in the AACT database"""
-
-        # Add RAG capability only if enabled
+        # System prompt (condensed for token efficiency)
         enable_rag = os.getenv("ENABLE_RAG", "false").lower() == "true"
-        if enable_rag:
-            base_prompt += """
-- **Semantic search using RAG**: Instantly search cached ALS research papers using AI-powered semantic matching"""
 
-        base_prompt += """
-- Fetch and analyze web content
-- Synthesize information from multiple sources
-- Provide citations with PMIDs, DOIs, and NCT IDs
+        base_prompt = """You are ALSARA, an expert ALS research assistant. ALL queries are in the context of ALS unless stated otherwise.
 
-=== AGENTIC WORKFLOW (REQUIRED) ===
+SEARCH RULES: ALWAYS include "ALS" or "amyotrophic lateral sclerosis" in every search query.
 
-You MUST follow ALL FOUR phases for EVERY query - no exceptions:
+=== WORKFLOW (REQUIRED FOR EVERY RESEARCH QUERY) ===
 
-1. **🎯 PLANNING PHASE** (MANDATORY - ALWAYS FIRST):
-   Before using any tools, you MUST explicitly outline your search strategy:"""
+Follow these phases in order. Each phase marker must be bold on its own line (e.g., **🎯 PLANNING:**).
+
+1. **🎯 PLANNING:** Outline your search strategy — which databases, search terms, and prioritization."""
 
         if enable_rag:
             base_prompt += """
-   - FIRST check research memory using semantic_search to find cached papers on this topic
-   - If memory returns results, check their indexed_at dates:
-     • Papers indexed < 30 days ago → use memory + skip PubMed for those subtopics
-     • Papers indexed ≥ 30 days ago → use memory AND search PubMed for newer publications since that date (freshness check)
-   - If memory returns no results → full PubMed search as normal (new topic)"""
+   Start with semantic_search for cached context, but ALWAYS also search PubMed and/or AACT — never rely on cached data alone."""
 
         base_prompt += """
-   - State what databases you will search and in what order
-   - ALWAYS plan to search PubMed for peer-reviewed research
-   - For clinical questions, also include AACT trials database
-   - Identify key search terms and variations
-   - Explain your prioritization approach
-   - Format: MUST start on a NEW LINE with "**🎯 PLANNING:**" followed by your strategy
 
-2. **🔧 EXECUTION PHASE** (MANDATORY - AFTER PLANNING):
-   - MUST mark this phase on a NEW LINE with "**🔧 EXECUTING:**"
-   - Execute your planned searches systematically"""
+2. **🔧 EXECUTING:** Run your planned searches. You MUST search at least 2 sources in parallel:
+   - ALWAYS search PubMed for peer-reviewed literature
+   - For treatment/drug queries: ALSO search AACT trials (search_als_trials or find_trials_near_me)
+   - RAG semantic_search is supplementary — never use it as your only source
+
+3. **🤔 REFLECTING:** Evaluate results. If gaps remain, do additional searches within this phase (don't restart the workflow)."""
 
         if enable_rag:
             base_prompt += """
-   - START with semantic search using RAG for instant cached results"""
+   Index significant papers as you go via llamaindex__index_paper (title, abstract snippet, authors, doi, year, url, finding)."""
 
         base_prompt += """
-   - MINIMUM requirement: Search PubMed for peer-reviewed literature
-   - For clinical questions, search AACT trials database
-   - Gather initial results from each source
-   - Show tool calls and results
-   - This phase is for INITIAL searches only (as planned)
 
-3. **🤔 REFLECTION PHASE** (MANDATORY - AFTER EXECUTION):
-   After tool execution, you MUST ALWAYS reflect before synthesizing:
+4. **✅ SYNTHESIS:** Comprehensive answer with:
+   - Direct answer to the question
+   - Numbered citations [1], [2] with clickable URLs (PubMed: https://pubmed.ncbi.nlm.nih.gov/PMID/, trials: https://clinicaltrials.gov/study/NCTID)
+   - Confidence scoring: 🟢 High (multiple peer-reviewed studies), 🟡 Moderate (limited/preprint), 🔴 Low (single study/theoretical)
+   - If searches failed: state limitations and provide knowledge-based answer
+   - Suggested follow-up questions"""
 
-   CRITICAL FORMAT REQUIREMENTS:
-   - MUST be EXACTLY: **🤔 REFLECTING:**
-   - MUST include the asterisks (**) for bold formatting
-   - MUST start on a NEW LINE (never inline with other text)
-   - WRONG: "🤔 REFLECTING:" (missing asterisks)
-   - WRONG: "search completed🤔 REFLECTING:" (inline, not on new line)
-   - CORRECT: New line, then **🤔 REFLECTING:**
+        if enable_rag:
+            base_prompt += """
 
-   Content requirements:
-   - Evaluate: "Do I have sufficient information to answer comprehensively?"
-   - Identify gaps: "What aspects of the query remain unaddressed?"
-   - Decide: "Should I refine my search or proceed to synthesis?"
+5. **📚 MEMORY UPDATE:** One-line summary: "Indexed N new papers | M already in memory | Topic: [topic]"."""
 
-   CRITICAL: If you need more searches:
-   - DO NOT start a new PLANNING phase
-   - DO NOT write new phase markers
-   - Stay WITHIN the REFLECTION phase
-   - Simply continue searching and analyzing while in REFLECTING mode
-   - Additional searches are part of reflection, not a new workflow
+        base_prompt += """
 
-   INDEX AS YOU GO (do this during reflection, not at the end):
-   - After each search batch, immediately call `llamaindex__index_paper` for each significant paper found
-   - Do NOT wait until the Memory Update phase — index papers as you find them
-   - This prevents hitting token limits before indexing happens
-   - Keep index calls concise: title, abstract (first 300 chars), authors, doi, year, url, 1-sentence finding
-   - Skip papers where response returns `"status": "already_indexed"`
+=== KEY RULES ===
+- Each phase appears EXACTLY ONCE. Never repeat or restart the workflow.
+- NEVER invent citations. Only cite papers actually found via search tools.
+- Prioritize recent research (2023-2025). Note preprints are NOT peer-reviewed.
+- Use search result abstracts for synthesis. Only fetch full details for top 5-7 most relevant papers.
+- If searches return nothing: broaden terms, try synonyms, then state what was tried.
 
-   - NEVER skip this phase - it ensures answer quality
+=== CLINICAL TRIALS ===
+- LOCATION SEARCH: aact__find_trials_near_me — find trials near a city, ZIP code, or coordinates. Supports radius_miles and subtype filters (SOD1, C9orf72, bulbar, limb, familial, sporadic). USE THIS for any location-based trial query.
+- NEW TRIALS: aact__check_new_als_trials — find trials posted or updated in the last N days. Supports subtype filter.
+- GENERAL SEARCH: aact__search_als_trials — search by status, phase, intervention. Use uppercase status: RECRUITING, COMPLETED, etc.
+- FALLBACK: trials_links__get_known_als_trials — curated list of important ALS trials.
 
-4. **✅ SYNTHESIS PHASE** (MANDATORY - FINAL PHASE):
-   - MUST start on a NEW LINE with "**✅ SYNTHESIS:**"
-   - Provide comprehensive synthesis of all findings
-   - Include all citations with URLs
-   - Summarize key insights
-   - **CONFIDENCE SCORING**: Include confidence level for key claims:
-     • High confidence (🟢): Multiple peer-reviewed studies or systematic reviews
-     • Moderate confidence (🟡): Limited studies or preprints with consistent findings
-     • Low confidence (🔴): Single study, conflicting evidence, or theoretical basis
-   - This phase MUST appear in EVERY response
+IMPORTANT: When the user asks about trials near a location, ALWAYS use find_trials_near_me (not search_als_trials with location filter).
 
-5. **📚 MEMORY UPDATE PHASE** (MANDATORY when RAG enabled - AFTER SYNTHESIS):
-   - MUST start on a NEW LINE with "**📚 MEMORY UPDATE:**"
-   - Papers should already be indexed during the Reflection phase — this is just a summary
-   - Write a single line: "Indexed N new papers | M already in memory | Topic: [topic]"
-   - If indexing was skipped entirely, index up to 3 most important papers here as a fallback
-   - Keep this phase SHORT — it is a status report, not where indexing happens
-
-FORMATTING RULES:
-- Each phase marker MUST appear on its own line
-- Never put phase markers inline with other text
-- Always use the exact format: **[emoji] PHASE_NAME:**
-- MUST include asterisks for bold: **🤔 REFLECTING:** not just 🤔 REFLECTING:
-- Each phase should appear EXACTLY ONCE per response - never repeat the workflow
-
-CRITICAL WORKFLOW RULES:
-- You MUST include ALL FIVE phases in your response
-- Each phase appears EXACTLY ONCE (never repeat Planning→Executing→Reflecting→Synthesis→Memory Update)
-- Missing any phase is unacceptable
-- Duplicating phases is unacceptable
-- The workflow is a SINGLE CYCLE:
-  1. PLANNING (once at start)
-  2. EXECUTING (initial searches)
-  3. REFLECTING (evaluate AND do additional searches if needed - all within this phase)
-  4. SYNTHESIS (final answer)
-  5. MEMORY UPDATE (index new papers found this session)
-- NEVER restart the workflow - additional searches happen WITHIN reflection
-
-CRITICAL SYNTHESIS RULES:
-- You MUST ALWAYS follow synthesis with a 📚 MEMORY UPDATE phase
-- If searches fail, state "Despite search limitations..." and provide knowledge-based answer
-- If you reach iteration limits, immediately provide synthesis then memory update
-- NEVER end without both synthesis and memory update - both are MANDATORY
-- If uncertain, start synthesis with: "Based on available information..."
-
-SYNTHESIS MUST INCLUDE:
-1. Direct answer to the user's question
-2. Key findings from successful searches (if any)
-3. Citations with clickable URLs
-4. If searches failed: explanation + knowledge-based answer
-5. Suggested follow-up questions or alternative approaches
-
-=== SELF-CORRECTION BEHAVIOR ===
-
-If your searches return zero or insufficient results:
-- Try broader search terms (remove qualifiers)
-- Try alternative terminology or synonyms
-- Search for related concepts
-- Explicitly state what you tried and what you found
-
-When answering:
-1. Be concise in explanations while maintaining clarity
-2. Focus on presenting search results efficiently
-3. Always cite sources with specific identifiers AND URLs:
-   - PubMed: Include PMID and URL (https://pubmed.ncbi.nlm.nih.gov/PMID/)
-   - Preprints: Include DOI and URL (https://doi.org/DOI)
-   - Clinical Trials: Include NCT ID and URL (https://clinicaltrials.gov/study/NCTID)
-4. Use numbered citations [1], [2] with a references section at the end
-5. Prioritize recent research (2023-2025)
-6. When discussing preprints, note they are NOT peer-reviewed
-7. Explain complex concepts clearly
-8. Acknowledge uncertainty when appropriate
-9. Suggest related follow-up questions
-
-CRITICAL CITATION RULES:
-- ONLY cite papers, preprints, and trials that you have ACTUALLY found using the search tools
-- NEVER make up or invent citations, PMIDs, DOIs, or NCT IDs
-- NEVER cite papers from your training data unless you have verified them through search
-- If you cannot find specific research on a topic, explicitly state "No studies found" rather than inventing citations
-- Every citation must come from actual search results obtained through the available tools
-- If asked about a topic you know from training but haven't searched, you MUST search first before citing
-
-IMPORTANT: When referencing papers in your final answer, ALWAYS include clickable URLs alongside citations to make it easy for users to access the sources.
-
-Available tools:
-- pubmed__search_pubmed: Search peer-reviewed research literature
-- pubmed__get_paper_details: Get full paper details from PubMed (USE SPARINGLY - only for most relevant papers)
-# - biorxiv__search_preprints: (temporarily unavailable)
-# - biorxiv__get_preprint_details: (temporarily unavailable)
-- aact__search_aact_trials: Search clinical trials (PRIMARY - use this first)
-- aact__get_aact_trial: Get specific trial details from AACT database
-- trials_links__get_known_als_trials: Get curated list of important ALS trials (FALLBACK)
-- trials_links__get_search_link: Generate direct ClinicalTrials.gov search URLs
-- fetch__fetch_url: Retrieve web content
-- llamaindex__semantic_search: Search persistent research memory (vector similarity — use FIRST in every session)
-- llamaindex__index_paper: Save a paper to persistent memory (call after synthesis for each key paper)
-- llamaindex__list_indexed_papers: List all papers currently in memory (useful to audit coverage)
-- llamaindex__get_research_connections: Find papers in memory related to a given title
-
-PERFORMANCE OPTIMIZATION:
-- Search results already contain abstracts - use these for initial synthesis
-- Only fetch full details for papers that are DIRECTLY relevant to the query
-- Limit detail fetches to 5-7 most relevant items per database
-- Prioritize based on: recency, relevance to query, impact/importance
-
-Search strategy:
-1. Search all relevant databases (PubMed, AACT clinical trials)
-2. ALWAYS supplement with web fetching to:
-   - Find additional information not in databases
-   - Access sponsor/institution websites
-   - Get recent news and updates
-   - Retrieve full-text content when needed
-   - Verify and expand on database results
-3. Synthesize all sources for comprehensive answers
-
-For clinical trials - NEW ARCHITECTURE:
-PRIMARY SOURCE - AACT Database:
-- Use search_aact_trials FIRST - provides comprehensive clinical trials data from AACT database
-- 559,000+ trials available with no rate limits
-- Use uppercase status values: RECRUITING, ACTIVE_NOT_RECRUITING, NOT_YET_RECRUITING, COMPLETED
-- For ALS searches, the condition "ALS" will automatically match related terms
-
-FALLBACK - Links Server (when AACT unavailable):
-- Use get_known_als_trials for curated list of 8 important ALS trials
-- Use get_search_link to generate search URLs for clinical trials
-- Use get_trial_link to generate direct links to specific trials
-
-ADDITIONAL SOURCES:
-- If specific NCT IDs are mentioned, can also use fetch__fetch_url with:
-  https://clinicaltrials.gov/study/{NCT_ID}
-- Search sponsor websites, medical news, and university pages for updates
-
-ARCHITECTURE FLOW:
-User Query → AACT Database (Primary)
-                ↓
-         If AACT unavailable
-                ↓
-         Links Server (Fallback)
-                ↓
-         Direct links to trial websites
-
-Note: Direct API access is unavailable - using AACT database instead
+=== SELF-CORRECTION ===
+If zero results: broaden terms, try synonyms, search related concepts. State what you tried.
 """
 
         # Add enhanced instructions for Llama models to improve thoroughness
@@ -1037,7 +958,7 @@ Keep your response friendly and informative."""
                 full_response += working_text
                 yield filter_internal_tags(full_response)  # Show working indicator immediately
 
-            # Execute tool calls in parallel for better performance
+            # Execute tool calls in parallel (results arrive via as_completed for faster reporting)
             from parallel_tool_execution import execute_tool_calls_parallel
             progress_text, tool_results_content = await execute_tool_calls_parallel(
                 tool_calls=tool_calls,
@@ -1047,7 +968,7 @@ Keep your response friendly and informative."""
             # Add progress text to full response and yield accumulated content
             full_response += progress_text
             if progress_text:
-                yield filter_internal_tags(full_response)  # Yield full accumulated response
+                yield filter_internal_tags(full_response)
 
             # Add single user message with ALL tool results
             messages.append({
@@ -1056,6 +977,7 @@ Keep your response friendly and informative."""
             })
 
             # Smart reflection: Only add reflection prompt if results seem incomplete
+            needs_reflection = False  # Default for tool_iteration > 1
             if tool_iteration == 1:
                 # First iteration - use normal workflow with reflection
                 # Check confidence indicators in tool results
@@ -1091,7 +1013,7 @@ Keep your response friendly and informative."""
 
                 if needs_reflection:
                     reflection_prompt = [
-                        {"type": "text", "text": "\n\n**SMART REFLECTION:** Based on the results so far, please evaluate:\n\n1. Do you have sufficient high-quality information to answer comprehensively?\n2. Are there important aspects that need more investigation?\n3. Would refining search terms or trying different databases help?\n\nIf confident with current information (found relevant studies/trials), proceed to synthesis with (**✅ ANSWER:**). Otherwise, use reflection markers (**🤔 REFLECTING:**) and search for missing information."}
+                        {"type": "text", "text": "\n\nEvaluate your results. If gaps remain, search more within a **🤔 REFLECTING:** phase. When ready, you MUST provide **✅ SYNTHESIS:** with your complete answer. Always end with synthesis."}
                     ]
                     messages.append({
                         "role": "user",
@@ -1101,9 +1023,8 @@ Keep your response friendly and informative."""
                 else:
                     # High confidence - skip reflection and go straight to synthesis
                     logger.info(f"Skipping reflection - high confidence (low_conf:{low_conf_count}, high_conf:{high_conf_count}, results:{total_results})")
-                    # Add a synthesis-only prompt
                     synthesis_prompt = [
-                        {"type": "text", "text": "\n\n**HIGH CONFIDENCE RESULTS:** The search returned comprehensive information. Please proceed directly to synthesis with (**✅ SYNTHESIS:**) and provide a complete answer based on the findings."}
+                        {"type": "text", "text": "\n\nResults look comprehensive. Provide your **✅ SYNTHESIS:** now with the complete answer."}
                     ]
                     messages.append({
                         "role": "user",
@@ -1120,9 +1041,12 @@ Keep your response friendly and informative."""
                     "content": update_prompt
                 })
 
+            # Compress older messages to reduce token usage before synthesis call
+            messages = compress_messages_for_synthesis(messages, keep_last_n=3)
+
             # Second API call with tool results (with retry logic)
-            logger.info("Starting second streaming API call with tool results...")
-            logger.info(f"Messages array has {len(messages)} messages")
+            logger.info("Starting synthesis API call...")
+            logger.info(f"Messages array has {len(messages)} messages (after compression)")
             logger.info(f"Last 3 messages: {json.dumps([{'role': m.get('role'), 'content_type': type(m.get('content')).__name__, 'content_len': len(str(m.get('content')))} for m in messages[-3:]], indent=2)}")
             # Log the actual tool results content
             logger.info(f"Tool results content ({len(tool_results_content)} items): {json.dumps(tool_results_content[:1], indent=2) if tool_results_content else 'EMPTY'}")  # Log first item only to avoid spam
@@ -1142,8 +1066,13 @@ IMPORTANT: Do NOT repeat the workflow phases (Planning/Executing/Reflecting/Synt
 Simply provide updated content that incorporates both previous and new information.
 Start your response directly with the updated information, no phase markers needed."""
 
-            # Limit tools on subsequent iterations to prevent endless loops
-            available_tools = tools if tool_iteration == 1 else []  # No more tools after first iteration
+            # Smart tool selection: no tools when we expect synthesis, tools when reflection needed
+            if tool_iteration > 1:
+                available_tools = []  # No more tools after first iteration
+            elif needs_reflection:
+                available_tools = tools  # Reflection may need additional searches
+            else:
+                available_tools = []  # High confidence → synthesis only, no tools needed
 
             async for response_text, current_tool_calls, provider_used in stream_with_retry(
                 client=client,
@@ -1237,34 +1166,12 @@ Start your response directly with the updated information, no phase markers need
         if tool_iteration >= max_tool_iterations:
             logger.warning(f"Reached maximum tool iterations ({max_tool_iterations})")
 
-        # Force synthesis if we haven't provided one yet
-        if tool_iteration > 0 and "✅ SYNTHESIS:" not in full_response:
-            logger.warning(f"No synthesis found after {tool_iteration} iterations, forcing synthesis")
-
-            # Add a forced synthesis prompt
-            synthesis_prompt_content = [{"type": "text", "text": "You MUST now provide a ✅ SYNTHESIS phase. Synthesize whatever information you've gathered, even if searches were limited. If you couldn't find specific research, provide knowledge-based answers with appropriate caveats."}]
-            messages.append({
-                "role": "user",
-                "content": synthesis_prompt_content
-            })
-
-            # Make final synthesis call without tools
-            forced_synthesis = ""
-            async for response_text, _, _ in stream_with_retry(
-                client=client,
-                messages=messages,
-                tools=[],  # No tools - just synthesize
-                system_prompt=system_prompt,
-                max_retries=1,
-                model=ANTHROPIC_MODEL,
-                max_tokens=MAX_RESPONSE_TOKENS,
-                stream_name="forced synthesis"
-            ):
-                forced_synthesis = response_text
-
-            full_response += "\n\n" + forced_synthesis
-            # Yield the full accumulated response with forced synthesis
-            yield filter_internal_tags(full_response)
+        # Check if synthesis was provided — with condensed prompt this should rarely trigger
+        has_synthesis = any(marker in full_response for marker in ["✅ SYNTHESIS:", "✅ ANSWER:", "## Summary", "## Conclusion"])
+        if tool_iteration > 0 and not has_synthesis:
+            logger.warning(f"No synthesis marker found after {tool_iteration} iterations — the response may still contain useful content")
+            # Don't make an extra API call — the response likely has the answer already,
+            # just without the exact marker. The condensed prompt should prevent this.
 
         # No final yield needed - response has already been yielded incrementally
 
@@ -1349,9 +1256,10 @@ async def main() -> None:
                 msg = gr.Textbox(
                     placeholder="Ask about ALS research, treatments, or clinical trials...",
                     container=False,
-                    label="Type your question or use voice input"
+                    label="Type your question"
                 )
-            with gr.Column(scale=1):
+            # Voice input disabled
+            with gr.Column(scale=1, visible=False):
                 audio_input = gr.Audio(
                     sources=["microphone"],
                     type="filepath",
@@ -1364,9 +1272,9 @@ async def main() -> None:
             retry_btn = gr.Button("🔄 Retry")
             undo_btn = gr.Button("↩️ Undo")
             clear_btn = gr.Button("🗑️ Clear")
-            speak_btn = gr.Button("🔊 Read Last Response", variant="secondary", interactive=False)
+            speak_btn = gr.Button("🔊 Read Last Response", variant="secondary", interactive=False, visible=False)  # Voice disabled
 
-        # Audio output component (initially hidden)
+        # Audio output component (voice disabled)
         with gr.Row(visible=False) as audio_row:
             audio_output = gr.Audio(
                 label="🔊 Voice Output",
@@ -1377,18 +1285,15 @@ async def main() -> None:
 
         gr.Examples(
             examples=[
-                "Psilocybin trials and use in therapy",
-                "Role of Omega-3 and omega-6 fatty acids in ALS treatment",
-                "List the main genes that should be tested for ALS gene therapy eligibility",
-                "What are the latest SOD1-targeted therapies in recent preprints?",
-                "Find recruiting clinical trials for bulbar-onset ALS",
-                "Explain the role of TDP-43 in ALS pathology",
-                "What is the current status of tofersen clinical trials?",
-                "Are there any new combination therapies being studied?",
-                "What's the latest research on ALS biomarkers from the past 60 days?",
-                "Search PubMed for recent ALS gene therapy research"
+                "Find Phase 2/3 ALS trials near Paris, France",
+                "New ALS trials posted in the last 30 days",
+                "Tofersen clinical trial status",
+                "What supplements are recommended for ALS?",
+                "Omega-3 and vitamin D in ALS treatment",
+                "SOD1-targeted therapies in recent preprints",
             ],
-            inputs=msg
+            inputs=msg,
+            examples_per_page=6,
         )
 
         # Chat interface logic with improved error handling
@@ -1762,15 +1667,15 @@ async def main() -> None:
             lambda: "", None, [msg]
         )
 
-        # Add event handler for audio input
-        audio_input.stop_recording(
-            process_voice_input,
-            inputs=[audio_input],
-            outputs=[msg]
-        ).then(
-            lambda: None,
-            outputs=[audio_input]  # Clear audio after processing
-        )
+        # Voice input event handler (disabled)
+        # audio_input.stop_recording(
+        #     process_voice_input,
+        #     inputs=[audio_input],
+        #     outputs=[msg]
+        # ).then(
+        #     lambda: None,
+        #     outputs=[audio_input]  # Clear audio after processing
+        # )
 
         submit_btn.click(
             respond, [msg, chatbot], [chatbot],
@@ -1806,10 +1711,11 @@ async def main() -> None:
             api_name="export"
         )
 
-        speak_btn.click(
-            speak_last_response, [chatbot], [audio_row, audio_output],
-            api_name="speak"
-        )
+        # Voice output event handler (disabled)
+        # speak_btn.click(
+        #     speak_last_response, [chatbot], [audio_row, audio_output],
+        #     api_name="speak"
+        # )
 
     # Enable queue for streaming to work
     demo.queue()
@@ -1817,10 +1723,50 @@ async def main() -> None:
     try:
         # Use environment variable for port, default to 7860 for HuggingFace
         port = int(os.environ.get("GRADIO_SERVER_PORT", 7860))
+
+        # Optional password protection with brute-force lockout
+        auth = None
+        app_user = os.environ.get("APP_USERNAME")
+        app_pass = os.environ.get("APP_PASSWORD")
+        if app_user and app_pass:
+            _failed_attempts = {}  # ip-free tracker: {username: (count, last_attempt_time)}
+            _max_attempts = 5
+            _lockout_seconds = 300  # 5 minute lockout after 5 failures
+
+            def auth_with_lockout(username, password):
+                now = time.time()
+                key = username.lower().strip()
+
+                # Check lockout
+                if key in _failed_attempts:
+                    count, last_time = _failed_attempts[key]
+                    if count >= _max_attempts and (now - last_time) < _lockout_seconds:
+                        remaining = int(_lockout_seconds - (now - last_time))
+                        logger.warning(f"Auth locked out for '{key}' — {remaining}s remaining")
+                        return False
+
+                # Check credentials
+                if username == app_user and password == app_pass:
+                    _failed_attempts.pop(key, None)  # Clear on success
+                    return True
+
+                # Track failure
+                if key in _failed_attempts:
+                    count, _ = _failed_attempts[key]
+                    _failed_attempts[key] = (count + 1, now)
+                else:
+                    _failed_attempts[key] = (1, now)
+                logger.warning(f"Failed login attempt for '{key}' ({_failed_attempts[key][0]}/{_max_attempts})")
+                return False
+
+            auth = auth_with_lockout
+            logger.info(f"Password protection enabled (lockout after {_max_attempts} failures for {_lockout_seconds}s)")
+
         demo.launch(
             server_name="0.0.0.0",
             server_port=port,
             share=False,
+            auth=auth,
             ssr_mode=False  # Disable SSR for compatibility with async initialization
         )
     except KeyboardInterrupt:

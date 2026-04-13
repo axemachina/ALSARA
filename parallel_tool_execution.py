@@ -53,13 +53,25 @@ async def execute_single_tool(
             if count_matches:
                 results_count = int(count_matches[0])
 
-            # Check for no results
-            if any(phrase in result_lower for phrase in [
+            # Also check JSON "total" field (from structured tool responses)
+            if results_count == 0:
+                total_matches = re.findall(r'"total":\s*(\d+)', result_lower)
+                if total_matches:
+                    results_count = int(total_matches[0])
+
+            # Check for explicit no-results indicators
+            no_result_phrases = [
                 "no results found", "0 results", "no papers found",
                 "no trials found", "no preprints found", "not found",
-                "zero results", "no matches"
-            ]) or results_count == 0:
+                "zero results", "no matches", "no als trials found",
+                "no recruiting als trials", "no new or updated"
+            ]
+            if any(phrase in result_lower for phrase in no_result_phrases):
                 has_results = False
+            elif results_count == 0 and '"error"' not in result_lower:
+                # Only mark as no-results if count is 0 AND no error (avoid false negatives)
+                # If we simply couldn't detect a count, assume results exist
+                has_results = True
 
         # Create clear success/failure indicator
         if has_results:
@@ -107,11 +119,17 @@ async def execute_single_tool(
 
 async def execute_tool_calls_parallel(
     tool_calls: List[Dict],
-    call_mcp_tool_func
+    call_mcp_tool_func,
+    progress_callback=None
 ) -> Tuple[str, List[Dict]]:
     """
-    Execute tool calls in parallel and collect results.
-    Maintains the original order of tool calls in results.
+    Execute tool calls in parallel, reporting results as they arrive.
+    Maintains the original order of tool calls in final results.
+
+    Args:
+        tool_calls: List of tool calls to execute
+        call_mcp_tool_func: Function to call MCP tools
+        progress_callback: Optional async callback(progress_text) called as each tool completes
 
     Returns: (progress_text, tool_results_content)
     """
@@ -120,55 +138,62 @@ async def execute_tool_calls_parallel(
 
     # Track execution time for progress reporting
     start_time = asyncio.get_event_loop().time()
-
-    # Log parallel execution
-    logger.info(f"Executing {len(tool_calls)} tools in parallel")
-
-    # Create tasks for parallel execution
-    tasks = [
-        execute_single_tool(tool_call, call_mcp_tool_func, i)
-        for i, tool_call in enumerate(tool_calls)
-    ]
-
-    # Execute all tasks in parallel
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Sort results by index to maintain original order
-    sorted_results = sorted(
-        [r for r in results if not isinstance(r, Exception)],
-        key=lambda x: x[0]
-    )
-
-    # Combine results with progress summary
-    completed_count = len(sorted_results)
     total_count = len(tool_calls)
 
-    # Create progress summary with timing info
+    # Log parallel execution
+    logger.info(f"Executing {total_count} tools in parallel")
+
+    # Create named tasks for as_completed tracking
+    tasks = {
+        asyncio.create_task(execute_single_tool(tool_call, call_mcp_tool_func, i)): i
+        for i, tool_call in enumerate(tool_calls)
+    }
+
+    # Collect results as they arrive
+    completed_results = []
+    completed_count = 0
+    progress_text = ""
+
+    for coro in asyncio.as_completed(tasks.keys()):
+        try:
+            result = await coro
+            completed_count += 1
+            index, prog_text, result_dict = result
+            completed_results.append((index, prog_text, result_dict))
+
+            # Report progress as each tool completes
+            progress_line = f"\n📊 **Search Progress:** Completed {completed_count}/{total_count} searches"
+            progress_line += prog_text
+            if progress_callback:
+                await progress_callback(progress_line)
+
+        except Exception as e:
+            completed_count += 1
+            logger.error(f"Task failed with exception: {e}")
+
+    # Sort results by original index to maintain order
+    completed_results.sort(key=lambda x: x[0])
+
+    # Build final progress text and results
     elapsed_time = asyncio.get_event_loop().time() - start_time
+    timing_info = f" in {elapsed_time:.1f}s" if elapsed_time > 5 else ""
 
-    if elapsed_time > 5:
-        timing_info = f" in {elapsed_time:.1f}s"
-    else:
-        timing_info = ""
-
-    progress_text = f"\n📊 **Search Progress:** Completed {completed_count}/{total_count} searches{timing_info}\n"
+    progress_text = f"\n📊 **Search Progress:** Completed {len(completed_results)}/{total_count} searches{timing_info}\n"
 
     tool_results_content = []
-
-    for index, prog_text, result_dict in sorted_results:
+    for index, prog_text, result_dict in completed_results:
         progress_text += prog_text
         tool_results_content.append(result_dict)
 
-    # Handle any exceptions
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            logger.error(f"Task {i} failed with exception: {result}")
-            # Add error result for failed tasks
-            if i < len(tool_calls):
-                tool_results_content.insert(i, {
+    # Handle any tasks that raised exceptions not caught above
+    for task, original_index in tasks.items():
+        if task.done() and task.exception() and original_index < len(tool_calls):
+            error_already_added = any(r[0] == original_index for r in completed_results)
+            if not error_already_added:
+                tool_results_content.append({
                     "type": "tool_result",
-                    "tool_use_id": tool_calls[i]["id"],
-                    "content": f"Tool execution failed: {str(result)}"
+                    "tool_use_id": tool_calls[original_index]["id"],
+                    "content": f"Tool execution failed: {str(task.exception())}"
                 })
 
     return progress_text, tool_results_content

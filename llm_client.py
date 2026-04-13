@@ -37,6 +37,7 @@ class UnifiedLLMClient:
             "use_fallback": os.getenv("USE_FALLBACK_LLM", "false").lower() == "true",
             "provider_preference": os.getenv("LLM_PROVIDER_PREFERENCE", "auto"),
             "default_model": os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
+            "fallback_model": os.getenv("ANTHROPIC_FALLBACK_MODEL", "claude-sonnet-4-20250514"),
             "max_retries": int(os.getenv("LLM_MAX_RETRIES", "2")),
             "is_hf_space": os.getenv("SPACE_ID") is not None,
             "enable_smart_routing": os.getenv("ENABLE_SMART_ROUTING", "false").lower() == "true"
@@ -166,9 +167,28 @@ class UnifiedLLMClient:
                     yield result
                 return  # Success, exit
             except Exception as e:
+                is_overloaded = (
+                    (hasattr(e, 'status_code') and e.status_code in (429, 529, 503))
+                    or 'overloaded' in str(e).lower()
+                )
+
+                # If primary model is overloaded, try fallback model before giving up
+                fallback_model = self.config.get("fallback_model")
+                if is_overloaded and fallback_model and fallback_model != model:
+                    logger.warning(f"Model {model} overloaded, falling back to {fallback_model}")
+                    try:
+                        async for result in self._stream_anthropic(
+                            messages, tools, system_prompt, fallback_model, max_tokens, temperature
+                        ):
+                            text, tc, _ = result
+                            yield (text, tc, f"Anthropic Claude (fallback: {fallback_model})")
+                        return
+                    except Exception as fallback_err:
+                        logger.warning(f"Fallback model {fallback_model} also failed: {fallback_err}")
+
                 logger.warning(f"Primary provider failed: {e}")
 
-                # Fall through to fallback if available
+                # Fall through to SambaNova fallback if available
                 if not self.fallback_router:
                     raise
 
@@ -301,6 +321,19 @@ class UnifiedLLMClient:
                     raise
 
             except Exception as e:
+                # Retry on overloaded/rate-limit errors (status 429, 529, 503)
+                is_retryable = False
+                if hasattr(e, 'status_code') and e.status_code in (429, 529, 503):
+                    is_retryable = True
+                elif 'overloaded' in str(e).lower() or 'rate_limit' in str(e).lower():
+                    is_retryable = True
+
+                if is_retryable and attempt < self.config["max_retries"]:
+                    logger.warning(f"Retryable API error on attempt {attempt + 1}: {e}")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                    continue
+
                 logger.error(f"Anthropic streaming error: {e}")
                 raise
 
