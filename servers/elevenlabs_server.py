@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from shared import config
 from shared.http_client import get_http_client
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging — force=True so we override any root handler FastMCP installed
+logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger(__name__)
 
 # Initialize MCP server

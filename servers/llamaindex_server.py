@@ -23,8 +23,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shared import config
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging — force=True overrides any root handler installed by FastMCP/anyio
+# at import time. Without force=True the basicConfig call is a no-op and INFO logs
+# from this module never surface in the Space log output.
+logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger(__name__)
 
 # Initialize MCP server

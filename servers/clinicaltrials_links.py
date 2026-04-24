@@ -9,8 +9,8 @@ import logging
 from typing import Optional
 from urllib.parse import quote_plus
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging — force=True so we override any root handler FastMCP installed
+logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("clinicaltrials-links")
