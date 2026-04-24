@@ -22,9 +22,9 @@ load_dotenv()
 # Add current directory to path for shared imports
 sys.path.insert(0, str(Path(__file__).parent))
 from shared import SimpleCache
-from custom_mcp_client import MCPClientManager
 from llm_client import UnifiedLLMClient
 from smart_cache import SmartCache, DEFAULT_PREWARM_QUERIES
+from services.registry import get_tool_schemas, call_tool as _registry_call_tool, flush_llamaindex
 
 # Helper function imports for refactored code
 from refactored_helpers import (
@@ -237,139 +237,29 @@ except ValueError as e:
     logger.error(f"LLM configuration error: {e}")
     raise
 
-# Global MCP client manager
-mcp_manager = MCPClientManager()
-
-# Internal thinking tags are always filtered for cleaner output
-
 # Model configuration
-# Use Claude 3.5 Sonnet with correct model ID that works with the API key
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
 logger.info(f"Using model: {ANTHROPIC_MODEL}")
 
-# Configuration for max tokens in responses
-# Set MAX_RESPONSE_TOKENS in .env to control response length
-# Claude Sonnet 4.5 supports up to 64K output tokens
 MAX_RESPONSE_TOKENS = min(int(os.getenv("MAX_RESPONSE_TOKENS") or "32000"), 64000)
 logger.info(f"Max response tokens set to: {MAX_RESPONSE_TOKENS}")
 
 # Global smart cache (24 hour TTL for research queries)
 smart_cache = SmartCache(cache_dir=".cache", ttl_hours=24)
 
-# Keep tool cache for MCP tool results
+# Keep tool cache for tool results
 tool_cache = SimpleCache(ttl=3600)
 
-# Cache for tool definitions to avoid repeated fetching
-_cached_tools = None
-_tools_cache_time = None
-TOOLS_CACHE_TTL = 86400  # 24 hour cache for tool definitions (tools rarely change)
-
-# Lazy-loading state for LlamaIndex RAG server
-_llamaindex_initialized = False
-_llamaindex_initializing = False
-
-async def _ensure_llamaindex_server():
-    """Lazy-load the LlamaIndex RAG server on first use (saves ~27s startup)"""
-    global _llamaindex_initialized, _llamaindex_initializing, _cached_tools, _tools_cache_time
-    if _llamaindex_initialized or _llamaindex_initializing:
-        return
-    _llamaindex_initializing = True
-    try:
-        script_dir = Path(__file__).parent.resolve()
-        server_path = script_dir / "servers" / "llamaindex_server.py"
-        logger.info("📚 Lazy-loading LlamaIndex RAG server (first semantic search)...")
-        await mcp_manager.add_server("llamaindex", str(server_path))
-        _llamaindex_initialized = True
-        # Invalidate tool cache so new tools are discovered
-        _cached_tools = None
-        _tools_cache_time = None
-        logger.info("✓ LlamaIndex RAG server loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to lazy-load LlamaIndex server: {e}")
-    finally:
-        _llamaindex_initializing = False
-
-async def setup_mcp_servers() -> MCPClientManager:
-    """Initialize all MCP servers using custom client"""
-    logger.info("Setting up MCP servers...")
-
-    # Get the directory where this script is located
-    script_dir = Path(__file__).parent.resolve()
-    servers_dir = script_dir / "servers"
-
-    logger.info(f"Script directory: {script_dir}")
-    logger.info(f"Servers directory: {servers_dir}")
-
-    # Verify servers directory exists
-    if not servers_dir.exists():
-        logger.error(f"Servers directory not found: {servers_dir}")
-        raise FileNotFoundError(f"Servers directory not found: {servers_dir}")
-
-    # Add all servers to manager
-    servers = {
-        "pubmed": servers_dir / "pubmed_server.py",
-        "aact": servers_dir / "aact_server.py",  # PRIMARY: AACT database for comprehensive clinical trials data
-        "trials_links": servers_dir / "clinicaltrials_links.py",  # FALLBACK: Direct links and known ALS trials
-        "fetch": servers_dir / "fetch_server.py",
-        # "elevenlabs": servers_dir / "elevenlabs_server.py",  # Voice capabilities for accessibility (disabled)
-    }
-
-    # bioRxiv preprint search (web scraping approach — relevance-ranked keyword search)
-    enable_biorxiv = os.getenv("ENABLE_BIORXIV", "false").lower() == "true"
-    if enable_biorxiv:
-        servers["biorxiv"] = servers_dir / "biorxiv_server.py"
-        logger.info("📄 bioRxiv preprint search enabled")
-    else:
-        logger.info("📄 bioRxiv disabled (set ENABLE_BIORXIV=true to enable)")
-
-    # LlamaIndex RAG is lazy-loaded on first semantic_search call (saves ~27s startup)
-    enable_rag = os.getenv("ENABLE_RAG", "false").lower() == "true"
-    if enable_rag:
-        logger.info("📚 RAG/LlamaIndex enabled (lazy-loaded on first use)")
-    else:
-        logger.info("🚀 RAG/LlamaIndex disabled (set ENABLE_RAG=true to enable)")
-
-    # Parallelize server initialization for faster startup
-    async def init_server(name: str, script_path: Path):
-        try:
-            await mcp_manager.add_server(name, str(script_path))
-            logger.info(f"✓ MCP server {name} initialized")
-        except Exception as e:
-            logger.error(f"Failed to initialize MCP server {name}: {e}")
-            raise
-
-    # Start all servers concurrently
-    tasks = [init_server(name, script_path) for name, script_path in servers.items()]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Check for any failures
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            name = list(servers.keys())[i]
-            logger.error(f"Failed to initialize MCP server {name}: {result}")
-            raise result
-
-    logger.info("All MCP servers initialized successfully")
-    return mcp_manager
-
-async def cleanup_mcp_servers() -> None:
-    """Cleanup MCP server sessions"""
-    logger.info("Cleaning up MCP server sessions...")
-
-    # Flush any pending chroma_db changes to the HF Dataset before shutting down
-    if _llamaindex_initialized and os.getenv("CHROMA_SYNC_REPO") and os.getenv("HF_TOKEN"):
-        try:
-            logger.info("Flushing chroma_db to Dataset repo before shutdown...")
-            result = await asyncio.wait_for(
-                mcp_manager.call_tool("llamaindex", "upload_now", {}),
-                timeout=15.0,
-            )
-            logger.info(f"Final upload result: {result}")
-        except Exception as e:
-            logger.warning(f"Final chroma_db upload failed (non-fatal): {e}")
-
-    await mcp_manager.close_all()
-    logger.info("MCP cleanup complete")
+async def call_tool_cached(tool_name: str, arguments: Dict[str, Any]) -> str:
+    """Dispatch a tool call with caching and rate limiting."""
+    cached_result = tool_cache.get(tool_name, arguments)
+    if cached_result:
+        return cached_result
+    await rate_limiter.wait_if_needed(tool_name.split("__")[0])
+    result = await _registry_call_tool(tool_name, arguments)
+    tool_cache.set(tool_name, arguments, result)
+    health_monitor.record_tool_call(tool_name)
+    return result
 
 
 def export_conversation(history: Optional[List[Any]]) -> Optional[Path]:
@@ -401,127 +291,6 @@ def export_conversation(history: Optional[List[Any]]) -> Optional[Path]:
 
     return filepath
 
-async def get_all_tools() -> List[Dict[str, Any]]:
-    """Retrieve all available tools from MCP servers with caching"""
-    global _cached_tools, _tools_cache_time
-
-    # Check if cache is valid
-    if _cached_tools and _tools_cache_time:
-        if time.time() - _tools_cache_time < TOOLS_CACHE_TTL:
-            logger.debug("Using cached tool definitions")
-            return _cached_tools
-
-    # Fetch fresh tool definitions
-    logger.info("Fetching fresh tool definitions from MCP servers")
-    all_tools = []
-
-    # Get tools from all servers
-    server_tools = await mcp_manager.list_all_tools()
-
-    for server_name, tools in server_tools.items():
-        for tool in tools:
-            # Convert MCP tool to Anthropic function format
-            all_tools.append({
-                "name": f"{server_name}__{tool['name']}",
-                "description": tool.get('description', ''),
-                "input_schema": tool.get('inputSchema', {})
-            })
-
-    # If RAG is enabled but llamaindex not yet loaded, add stub tool definitions
-    # so the LLM knows they exist and can request them (triggers lazy-load on call)
-    enable_rag = os.getenv("ENABLE_RAG", "false").lower() == "true"
-    if enable_rag and not _llamaindex_initialized:
-        llamaindex_tool_names = [name for name in [t["name"] for t in all_tools] if name.startswith("llamaindex__")]
-        if not llamaindex_tool_names:
-            all_tools.extend([
-                {"name": "llamaindex__semantic_search", "description": "Search persistent research memory using AI-powered semantic matching", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]}},
-                {"name": "llamaindex__index_paper", "description": "Save a paper to persistent memory for future retrieval", "input_schema": {"type": "object", "properties": {"title": {"type": "string"}, "abstract": {"type": "string"}, "authors": {"type": "string"}, "doi": {"type": "string"}, "year": {"type": "string"}, "url": {"type": "string"}, "finding": {"type": "string"}}, "required": ["title"]}},
-                {"name": "llamaindex__list_indexed_papers", "description": "List all papers currently in memory", "input_schema": {"type": "object", "properties": {}}},
-                {"name": "llamaindex__get_research_connections", "description": "Find papers in memory related to a given title", "input_schema": {"type": "object", "properties": {"title": {"type": "string"}}, "required": ["title"]}},
-            ])
-
-    # Update cache
-    _cached_tools = all_tools
-    _tools_cache_time = time.time()
-    logger.info(f"Cached {len(all_tools)} tool definitions")
-
-    return all_tools
-
-async def call_mcp_tool(tool_name: str, arguments: Dict[str, Any], max_retries: int = 3) -> str:
-    """Execute an MCP tool call with caching, rate limiting, retry logic, and error handling"""
-
-    # Lazy-load LlamaIndex server on first llamaindex tool call
-    if tool_name.startswith("llamaindex__") and not _llamaindex_initialized:
-        await _ensure_llamaindex_server()
-
-    # Check cache first (no retries needed for cached results)
-    cached_result = tool_cache.get(tool_name, arguments)
-    if cached_result:
-        return cached_result
-
-    last_error = None
-
-    for attempt in range(max_retries):
-        try:
-            # Apply rate limiting
-            await rate_limiter.wait_if_needed(tool_name.split("__")[0])
-
-            # Parse tool name
-            if "__" not in tool_name:
-                logger.error(f"Invalid tool name format: {tool_name}")
-                return f"Error: Invalid tool name format: {tool_name}"
-
-            server_name, tool_method = tool_name.split("__", 1)
-
-            if attempt > 0:
-                logger.info(f"Retry {attempt}/{max_retries} for tool: {tool_method} on server: {server_name}")
-            else:
-                logger.info(f"Calling tool: {tool_method} on server: {server_name}")
-
-            # Call tool with timeout using custom client
-            result = await asyncio.wait_for(
-                mcp_manager.call_tool(server_name, tool_method, arguments),
-                timeout=90.0  # 90 second timeout for complex tool calls (BioRxiv searches can be slow)
-            )
-
-            # Result is already a string from custom client
-            final_result = result if result else "No content returned from tool"
-
-            # Cache the result
-            tool_cache.set(tool_name, arguments, final_result)
-
-            # Record successful tool call
-            health_monitor.record_tool_call(tool_name)
-
-            return final_result
-
-        except asyncio.TimeoutError as e:
-            last_error = e
-            logger.warning(f"Tool call timed out (attempt {attempt + 1}/{max_retries}): {tool_name}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
-                continue
-            # Last attempt failed
-            timeout_error = TimeoutError(f"Tool timeout after {max_retries} attempts - the {server_name} server may be overloaded")
-            return format_error_message(timeout_error, context=f"Calling {tool_name}")
-
-        except ValueError as e:
-            logger.error(f"Invalid tool/server: {tool_name} - {e}")
-            return format_error_message(e, context=f"Invalid tool: {tool_name}")
-
-        except Exception as e:
-            last_error = e
-            logger.warning(f"Error calling tool {tool_name} (attempt {attempt + 1}/{max_retries}): {e}")
-            if attempt < max_retries - 1:
-                await asyncio.sleep(2 ** attempt)  # Exponential backoff
-                continue
-            # Last attempt failed
-            return format_error_message(e, context=f"Tool {tool_name} failed after {max_retries} attempts")
-
-    # Should not reach here, but handle just in case
-    if last_error:
-        return f"Tool failed after {max_retries} attempts: {str(last_error)[:200]}"
-    return "Unexpected error in tool execution"
 
 def filter_internal_tags(text: str) -> str:
     """Remove all internal processing tags from the output."""
@@ -953,7 +722,7 @@ CRITICAL: Thoroughness is MORE important than speed. Users expect comprehensive 
             # For now, just log it and continue with normal processing
 
         # Get available tools
-        tools = await get_all_tools()
+        tools = get_tool_schemas()
 
         # Check if this is a simple query that doesn't need research
         if not classification['requires_research']:
@@ -1093,7 +862,7 @@ Keep your response friendly and informative."""
             from parallel_tool_execution import execute_tool_calls_parallel
             progress_text, tool_results_content = await execute_tool_calls_parallel(
                 tool_calls=tool_calls,
-                call_mcp_tool_func=call_mcp_tool
+                call_mcp_tool_func=call_tool_cached
             )
 
             # Add progress text to full response and yield accumulated content
@@ -1307,7 +1076,7 @@ NEVER invent NCT IDs, PMIDs, or DOIs. Every citation must come from a tool resul
                     # Execute recursive tool calls
                     progress_text, tool_results_content = await execute_tool_calls(
                         tool_calls=additional_tool_calls,
-                        call_mcp_tool_func=call_mcp_tool
+                        call_mcp_tool_func=call_tool_cached
                     )
 
                     full_response += progress_text
@@ -1391,19 +1160,9 @@ async def main() -> None:
     """Main function to setup and launch the Gradio interface"""
     global cleanup_task
 
-    try:
-        # Setup MCP servers
-        logger.info("Setting up MCP servers...")
-        await setup_mcp_servers()
-        logger.info("MCP servers initialized successfully")
-
-        # Start memory cleanup task
-        cleanup_task = asyncio.create_task(cleanup_memory())
-        logger.info("Memory cleanup task started")
-
-    except Exception as e:
-        logger.error(f"Failed to initialize MCP servers: {e}", exc_info=True)
-        raise
+    # Start memory cleanup task
+    cleanup_task = asyncio.create_task(cleanup_memory())
+    logger.info(f"Direct service tools registered ({len(get_tool_schemas())} tools, 0 subprocesses)")
     
     # Auth config
     app_user = os.environ.get("APP_USERNAME")
@@ -1414,7 +1173,15 @@ async def main() -> None:
     _lockout_seconds = 300
 
     # Create Gradio interface with export button
-    with gr.Blocks() as demo:
+    MOBILE_CSS = """
+@media (max-width: 768px) {
+    .chatbot-container { height: 50vh !important; min-height: 300px !important; }
+    .gradio-container { padding: 8px !important; }
+}
+/* Prevent iOS zoom on input focus */
+input, textarea { font-size: 16px !important; }
+"""
+    with gr.Blocks(css=MOBILE_CSS) as demo:
         # Authentication state: True if logged in OR using own API key
         is_authenticated = gr.State(value=not auth_required)
         user_api_key = gr.State(value=None)  # If user provides their own Anthropic key
@@ -1446,7 +1213,7 @@ async def main() -> None:
         with gr.Tabs():
             with gr.TabItem("Chat"):
                 chatbot = gr.Chatbot(
-                    height=600,
+                    height="60vh",
                     show_label=False,
                     elem_classes="chatbot-container"
                 )
@@ -1819,46 +1586,18 @@ async def main() -> None:
                 if not clean_text or len(clean_text) < 10:
                     logger.warning("Synthesis text too short after cleaning, using original")
                     clean_text = last_response[:2500]  # Fallback to first 2500 chars
-                # Check if ElevenLabs server is available
-                try:
-                    server_tools = await mcp_manager.list_all_tools()
-                    elevenlabs_available = any('elevenlabs' in tool for tool in server_tools.keys())
-                    if not elevenlabs_available:
-                        logger.error("ElevenLabs server not available in MCP tools")
-                        return gr.update(visible=True), gr.update(
-                            value=None,
-                            label="⚠️ Voice service not available - Please set ELEVENLABS_API_KEY"
-                        )
-                except Exception as e:
-                    logger.error(f"Failed to check ElevenLabs availability: {e}", exc_info=True)
-                    return gr.update(visible=True), gr.update(
-                        value=None,
-                        label="⚠️ Voice service not available"
-                    )
-
                 # Remove phase markers from text
                 clean_text = re.sub(r'\*\*[🎯🔧🤔✅].*?:\*\*', '', clean_text)
-                # Call ElevenLabs text-to-speech through MCP
                 logger.info(f"Calling ElevenLabs text-to-speech with {len(clean_text)} characters...")
                 try:
-                    result = await call_mcp_tool(
-                        "elevenlabs__text_to_speech",
-                        {"text": clean_text, "speed": 0.95}  # Slightly slower for clarity
-                    )
+                    from servers.elevenlabs_server import text_to_speech as _tts
+                    tts_result = await _tts(text=clean_text, speed=0.95)
+                    result_data = json.loads(tts_result) if isinstance(tts_result, str) else tts_result
                 except Exception as e:
-                    logger.error(f"MCP tool call failed: {e}", exc_info=True)
+                    logger.error(f"ElevenLabs call failed: {e}", exc_info=True)
                     raise
 
-                # Parse the result
                 try:
-                    result_data = json.loads(result) if isinstance(result, str) else result
-                    # Check for API key error
-                    if "ELEVENLABS_API_KEY not configured" in str(result):
-                        logger.error("ElevenLabs API key not configured - found in result string")
-                        return gr.update(visible=True), gr.update(
-                            value=None,
-                            label="⚠️ Voice service unavailable - Please set ELEVENLABS_API_KEY environment variable"
-                        )
 
                     if result_data.get("status") == "success" and result_data.get("audio_base64"):
                         # Save audio to temporary file
@@ -2030,14 +1769,14 @@ async def main() -> None:
     finally:
         # Cleanup
         logger.info("Cleaning up resources...")
-        await cleanup_mcp_servers()
+        await flush_llamaindex()
 
 def _handle_sigterm(signum, frame):
     """Translate SIGTERM into KeyboardInterrupt so the graceful cleanup path runs.
 
     HF Spaces sends SIGTERM on Restart/rebuild. Python does NOT convert SIGTERM
     to KeyboardInterrupt automatically, so without this the process just dies
-    and cleanup_mcp_servers() (which flushes chroma_db to the Dataset repo)
+    and flush_llamaindex() (which syncs chroma_db to the Dataset repo)
     never gets the chance to run.
     """
     import signal as _signal
