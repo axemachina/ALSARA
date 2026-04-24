@@ -41,12 +41,20 @@ try:
     )
     from llama_index.core.node_parser import SentenceSplitter
     from llama_index.vector_stores.chroma import ChromaVectorStore
-    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
     import chromadb
     LLAMAINDEX_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     LLAMAINDEX_AVAILABLE = False
-    logger.warning("LlamaIndex not installed. Install with: pip install llama-index chromadb")
+    logger.warning(f"LlamaIndex core not installed: {e}. Install with: pip install llama-index-core llama-index-vector-stores-chroma chromadb")
+
+# HuggingFace embeddings are optional — we prefer fastembed (lightweight, no PyTorch).
+# This import is only needed as a fallback when USE_FASTEMBED=false.
+HUGGINGFACE_EMBEDDINGS_AVAILABLE = False
+try:
+    from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+    HUGGINGFACE_EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    HuggingFaceEmbedding = None  # type: ignore
 
 # Try fastembed (lightweight, no PyTorch needed — 68MB vs 469MB)
 FASTEMBED_AVAILABLE = False
@@ -57,25 +65,76 @@ except ImportError:
     pass
 
 # Configuration
-# On HF Spaces, copy pre-loaded chroma_db to writable location if needed
 _default_chroma_path = "./chroma_db"
-_hf_chroma_path = "/tmp/chroma_db"
+_hf_tmp_chroma_path = "/tmp/chroma_db"
 
-def _resolve_chroma_path():
-    """Resolve ChromaDB path, copying pre-loaded data to writable location on HF Spaces."""
-    configured = os.getenv("CHROMA_DB_PATH", "")
+# Sync config — reading here so both path resolution and manager init share the values
+CHROMA_SYNC_REPO = os.getenv("CHROMA_SYNC_REPO", "").strip()
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip() or None
+CHROMA_SYNC_BATCH_SIZE = int(os.getenv("CHROMA_SYNC_BATCH_SIZE", "5"))
+
+logger.info(
+    "Chroma sync config: SPACE_ID=%s, CHROMA_DB_PATH=%s, CHROMA_SYNC_REPO=%s, HF_TOKEN=%s, batch_size=%d",
+    bool(os.environ.get("SPACE_ID")),
+    os.getenv("CHROMA_DB_PATH", "(unset)"),
+    CHROMA_SYNC_REPO or "(unset)",
+    "set" if HF_TOKEN else "(unset)",
+    CHROMA_SYNC_BATCH_SIZE,
+)
+
+
+def _resolve_chroma_path() -> str:
+    """Resolve ChromaDB path and bootstrap it.
+
+    Priority:
+      1. CHROMA_DB_PATH env (used on HF Spaces with Persistent Storage, e.g. /data/chroma_db)
+      2. On HF Spaces without CHROMA_DB_PATH: /tmp/chroma_db (ephemeral legacy path)
+      3. Local dev: ./chroma_db (git-committed seed, unchanged)
+
+    Bootstrap on Spaces (paths 1 and 2): if the resolved directory is empty, try
+    to pull the latest snapshot from the HF Dataset repo; fall back to the
+    git-committed seed at ./chroma_db.
+    """
+    # Import inside the function so a missing dep in chroma_sync can't crash server import
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    try:
+        import chroma_sync
+    except ImportError:
+        chroma_sync = None
+
+    configured = os.getenv("CHROMA_DB_PATH", "").strip()
+    on_hf_space = bool(os.environ.get("SPACE_ID"))
+
     if configured:
-        return configured
-    # If running on HF Spaces (or ./chroma_db is not writable), copy to /tmp
-    source = Path(_default_chroma_path)
-    if source.exists() and os.environ.get("SPACE_ID"):
-        dest = Path(_hf_chroma_path)
-        if not dest.exists():
-            import shutil
-            shutil.copytree(str(source), str(dest))
-            logger.info(f"Copied pre-loaded chroma_db to {dest}")
-        return str(dest)
-    return _default_chroma_path
+        target = Path(configured)
+    elif on_hf_space:
+        target = Path(_hf_tmp_chroma_path)
+    else:
+        # Local dev: use the committed snapshot in-place
+        return _default_chroma_path
+
+    # We're on Spaces (either /data or /tmp). Make sure target is populated.
+    target.mkdir(parents=True, exist_ok=True)
+
+    if chroma_sync is not None and chroma_sync.is_populated(target):
+        logger.info(f"Using existing chroma_db at {target}")
+        return str(target)
+
+    # Empty — try Dataset first, then git seed
+    if chroma_sync is not None and CHROMA_SYNC_REPO and HF_TOKEN:
+        logger.info(f"chroma_db at {target} is empty — attempting Dataset restore from {CHROMA_SYNC_REPO}")
+        if chroma_sync.download_latest(CHROMA_SYNC_REPO, target, HF_TOKEN):
+            return str(target)
+
+    # Fallback: seed from git-committed snapshot
+    if chroma_sync is not None:
+        seed = Path(_default_chroma_path)
+        if chroma_sync.seed_from_committed(seed, target):
+            return str(target)
+
+    logger.warning(f"chroma_db at {target} is empty and no fallback worked — starting fresh")
+    return str(target)
+
 
 CHROMA_DB_PATH = _resolve_chroma_path()
 EMBED_MODEL = os.getenv("LLAMAINDEX_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
@@ -129,6 +188,9 @@ class ResearchMemoryManager:
         self.chroma_client = None
         self.collection = None
         self.metadata_path = Path(CHROMA_DB_PATH) / "metadata.json"
+        # Sync state — counts indexes since the last successful upload
+        self._indexes_since_sync = 0
+        self._sync_in_flight = False
 
         if LLAMAINDEX_AVAILABLE:
             self._initialize_index()
@@ -155,7 +217,7 @@ class ResearchMemoryManager:
             if USE_FASTEMBED and FASTEMBED_AVAILABLE:
                 embed_model = FastEmbedEmbedding(model_name=EMBED_MODEL)
                 logger.info(f"Using fastembed model: {EMBED_MODEL} (lightweight, no PyTorch)")
-            else:
+            elif HUGGINGFACE_EMBEDDINGS_AVAILABLE:
                 try:
                     embed_model = HuggingFaceEmbedding(
                         model_name=EMBED_MODEL,
@@ -168,6 +230,11 @@ class ResearchMemoryManager:
                         model_name="sentence-transformers/all-MiniLM-L6-v2",
                         cache_folder="./embed_cache"
                     )
+            else:
+                raise RuntimeError(
+                    "No embedding backend available. Install fastembed (recommended) "
+                    "or llama-index-embeddings-huggingface + sentence-transformers."
+                )
 
             # Configure settings
             Settings.embed_model = embed_model
@@ -300,6 +367,20 @@ class ResearchMemoryManager:
 
             logger.info(f"Indexed paper: {title}")
 
+            # Trigger a batched Dataset backup if configured
+            self._indexes_since_sync += 1
+            if (
+                CHROMA_SYNC_REPO
+                and HF_TOKEN
+                and not self._sync_in_flight
+                and self._indexes_since_sync >= CHROMA_SYNC_BATCH_SIZE
+            ):
+                try:
+                    asyncio.create_task(self._sync_upload())
+                except RuntimeError:
+                    # No running loop — skip silently, the shutdown hook will catch up
+                    pass
+
             return {
                 "status": "success",
                 "paper_id": paper_id,
@@ -313,6 +394,48 @@ class ResearchMemoryManager:
                 "status": "error",
                 "message": f"Failed to index paper: {str(e)}"
             }
+
+    async def _sync_upload(self) -> bool:
+        """Push the current chroma_db to the configured HF Dataset repo.
+
+        Fire-and-forget: never raises, logs errors, resets counter only on success.
+        """
+        if not (CHROMA_SYNC_REPO and HF_TOKEN):
+            logger.info("_sync_upload skipped: CHROMA_SYNC_REPO=%s HF_TOKEN=%s",
+                        CHROMA_SYNC_REPO or "(unset)", "set" if HF_TOKEN else "(unset)")
+            return False
+        if self._sync_in_flight:
+            logger.info("_sync_upload skipped: another upload already in flight")
+            return False
+        self._sync_in_flight = True
+        try:
+            # Import inside to keep the server import light if huggingface_hub is missing
+            try:
+                import chroma_sync
+            except ImportError:
+                logger.warning("chroma_sync module not available — skipping upload")
+                return False
+
+            pending = self._indexes_since_sync
+            commit_msg = f"Runtime snapshot: +{pending} papers since last sync"
+            logger.info("Starting chroma upload → %s (pending=%d, path=%s)",
+                        CHROMA_SYNC_REPO, pending, CHROMA_DB_PATH)
+            # Run the blocking upload in a thread so we don't stall the event loop
+            ok = await asyncio.to_thread(
+                chroma_sync.upload_snapshot,
+                CHROMA_SYNC_REPO,
+                Path(CHROMA_DB_PATH),
+                HF_TOKEN,
+                commit_msg,
+            )
+            if ok:
+                self._indexes_since_sync = 0
+                logger.info("chroma upload succeeded → %s", CHROMA_SYNC_REPO)
+            else:
+                logger.warning("chroma upload returned False → %s", CHROMA_SYNC_REPO)
+            return ok
+        finally:
+            self._sync_in_flight = False
 
     async def search_similar(
         self,
@@ -776,6 +899,47 @@ async def clear_research_memory(
     except Exception as e:
         logger.error(f"Error clearing memory: {e}")
         return json.dumps({"status": "error", "error": "Failed to clear memory", "message": str(e)}, indent=2)
+
+
+@mcp.tool()
+async def upload_now() -> str:
+    """Force an immediate upload of chroma_db to the configured HF Dataset repo.
+
+    Used by the app on graceful shutdown to flush pending runtime indexes.
+    Returns quickly if sync is not configured or a sync is already in flight.
+    """
+    logger.info("upload_now called (CHROMA_SYNC_REPO=%s, HF_TOKEN=%s, manager=%s)",
+                CHROMA_SYNC_REPO or "(unset)",
+                "set" if HF_TOKEN else "(unset)",
+                "yes" if memory_manager else "no")
+    if not CHROMA_SYNC_REPO or not HF_TOKEN:
+        return json.dumps({"status": "skipped", "reason": "CHROMA_SYNC_REPO or HF_TOKEN not set"})
+
+    if not memory_manager:
+        # Manager not initialized — still try to upload what's on disk
+        try:
+            import chroma_sync
+            logger.info("upload_now: manager unavailable, direct upload from %s", CHROMA_DB_PATH)
+            ok = await asyncio.to_thread(
+                chroma_sync.upload_snapshot,
+                CHROMA_SYNC_REPO,
+                Path(CHROMA_DB_PATH),
+                HF_TOKEN,
+                "Shutdown snapshot (no manager)",
+            )
+            logger.info("upload_now (no manager) result: %s", ok)
+            return json.dumps({"status": "success" if ok else "failed"})
+        except Exception as e:
+            logger.warning("upload_now (no manager) failed: %s", e)
+            return json.dumps({"status": "error", "message": str(e)})
+
+    try:
+        ok = await memory_manager._sync_upload()
+        logger.info("upload_now (via manager) result: %s", ok)
+        return json.dumps({"status": "success" if ok else "failed"})
+    except Exception as e:
+        logger.warning(f"upload_now failed: {e}")
+        return json.dumps({"status": "error", "message": str(e)})
 
 
 if __name__ == "__main__":

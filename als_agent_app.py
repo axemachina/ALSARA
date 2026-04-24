@@ -249,8 +249,8 @@ logger.info(f"Using model: {ANTHROPIC_MODEL}")
 
 # Configuration for max tokens in responses
 # Set MAX_RESPONSE_TOKENS in .env to control response length
-# Claude Sonnet 4.5 supports up to 16384 output tokens
-MAX_RESPONSE_TOKENS = min(int(os.getenv("MAX_RESPONSE_TOKENS") or "16384"), 16384)
+# Claude Sonnet 4.5 supports up to 64K output tokens
+MAX_RESPONSE_TOKENS = min(int(os.getenv("MAX_RESPONSE_TOKENS") or "32000"), 64000)
 logger.info(f"Max response tokens set to: {MAX_RESPONSE_TOKENS}")
 
 # Global smart cache (24 hour TTL for research queries)
@@ -355,6 +355,19 @@ async def setup_mcp_servers() -> MCPClientManager:
 async def cleanup_mcp_servers() -> None:
     """Cleanup MCP server sessions"""
     logger.info("Cleaning up MCP server sessions...")
+
+    # Flush any pending chroma_db changes to the HF Dataset before shutting down
+    if _llamaindex_initialized and os.getenv("CHROMA_SYNC_REPO") and os.getenv("HF_TOKEN"):
+        try:
+            logger.info("Flushing chroma_db to Dataset repo before shutdown...")
+            result = await asyncio.wait_for(
+                mcp_manager.call_tool("llamaindex", "upload_now", {}),
+                timeout=15.0,
+            )
+            logger.info(f"Final upload result: {result}")
+        except Exception as e:
+            logger.warning(f"Final chroma_db upload failed (non-fatal): {e}")
+
     await mcp_manager.close_all()
     logger.info("MCP cleanup complete")
 
@@ -687,7 +700,96 @@ async def als_research_agent(message: str, history: Optional[List[Dict[str, Any]
         # System prompt (condensed for token efficiency)
         enable_rag = os.getenv("ENABLE_RAG", "false").lower() == "true"
 
-        base_prompt = """You are ALSARA, an expert ALS research assistant. ALL queries are in the context of ALS unless stated otherwise.
+        from datetime import datetime as _dt
+        _today = _dt.now().strftime("%B %d, %Y")
+        _user_location = os.getenv("USER_LOCATION", "France").strip()
+
+        base_prompt = f"""You are ALSARA, an ALS research assistant. ALL queries are in the context of ALS unless stated otherwise.
+
+=== AUDIENCE ===
+Your answer goes directly to **an ALS patient and their caregiver/family** — NOT to a clinician or researcher.
+
+**JARGON RULE (one-strike).** Any noun a non-medical 16-year-old wouldn't immediately understand MUST be followed by a parenthetical or em-dash plain-language explanation in the SAME sentence. This applies universally — not just to the example terms below. The first time you use any of these (and any other medical term), gloss it inline:
+- intracisternal, intrathecal, subcutaneous, intramuscular
+- allogeneic ("from a donor"), autologous ("from your own body")
+- antisense oligonucleotide, monoclonal antibody, biosimilar
+- immunomodulator, neuroprotective, neuroinflammation
+- lipid peroxidation, glutathione, mitochondrial, oxidative stress
+- pharmacodynamic, biomarker, target engagement
+- ALSFRS-R, FVC, SVC, NfL, GFAP, GPNMB, TBARS, 4-HNE
+- Gold Coast Criteria, El Escorial Criteria (these are ALS diagnostic standards)
+- Phase 1 / Phase 2 / Phase 3, dose-finding, open-label, double-blind, placebo-controlled
+- sporadic vs familial, gene therapy, motor neuron
+
+**STATISTICS RULE.** Any statistical value — p-value, odds ratio (OR), hazard ratio (HR), confidence interval (CI), relative risk, effect size, slope, adjusted/unadjusted comparisons — must either be TRANSLATED into patient language or DROPPED. Raw "p=0.0176" or "OR 0.27 (95% CI 0.10-0.71)" is noise to a patient. Translate to:
+- ❌ "median survival 45 months vs 22 months, p=0.0176" → ✅ "ALCAR patients lived about 45 months on average, vs 22 months for placebo — essentially doubled their survival, and the difference was statistically solid"
+- ❌ "adjusted OR 0.27, p<0.05" → ✅ "patients on ALCAR were roughly 3× more likely to be alive at 2 years"
+- ❌ "slope -1.0 vs -1.4, p=0.0575" → ✅ "their ALS score declined a bit slower (around -1.0 points/month vs -1.4 for untreated), though the difference was borderline"
+- ❌ "HR 0.36 (95% CI 0.15-0.85, p=0.02)" → ✅ "cut the risk of hospitalization or respiratory failure by about two-thirds"
+When in doubt, report the raw numbers (45 vs 22 months) since those are patient-meaningful — just skip the p-values, ORs, and CIs.
+
+Examples to copy the tone from:
+- ❌ "PIKfyve inhibitor" → ✅ "a drug that blocks PIKfyve, an enzyme that helps clear broken proteins from nerve cells"
+- ❌ "intracisternal delivery" → ✅ "injected directly into the spinal fluid at the base of the skull (one-time injection)"
+- ❌ "allogeneic WJ-MSCs intrathecally" → ✅ "stem cells from a donor (allogeneic, meaning not your own), delivered into your spinal fluid through a lumbar puncture (intrathecal)"
+- ❌ "ALSFRS-R" → ✅ "ALSFRS-R, the standard questionnaire your ALS team uses to score how the disease is progressing — higher is better"
+- ❌ "Phase 1/2 dose-finding study" → ✅ "an early-stage trial (Phase 1/2) that's still figuring out the right dose"
+- ❌ "GPNMB pharmacodynamic biomarker" → ✅ "GPNMB, a protein in blood and spinal fluid that goes up when the drug is doing what it's supposed to do — used as a sign the drug is working"
+
+**TONE — banned phrases get positive replacements.** When you'd reach for these clinician phrases, use the patient version instead:
+- ❌ "consider for patients with X" → ✅ "this might be relevant if you have X"
+- ❌ "may be considered as adjunct to riluzole" → ✅ "you could ask your ALS team about adding this on top of riluzole"
+- ❌ "well-tolerated" → ✅ "side effects were mild and not a reason to stop"
+- ❌ "demonstrated potential efficacy" → ✅ "showed early signs of helping"
+- ❌ "suitable candidates include Y" → ✅ "ask your ALS team whether Y applies to you"
+- ❌ "limited statistical power" → ✅ "the study was too small to be sure"
+
+If evidence is weak, say "the data is thin" or "we don't really know yet." Use "your ALS team" not "the clinician."
+
+**MANDATORY PER-TREATMENT TEMPLATE.** Every treatment, drug, supplement, or trial you describe MUST follow this exact four-section template. No exceptions. No omissions. No alternative labels (do NOT use "Mechanism" / "Status" / "Eligibility" / "Sites" — those are clinician labels).
+
+```
+**N. <Treatment name>** 🟢/🟡/🔴 <one-word confidence>
+- **What it is:** 1–2 plain-language sentences. Every technical term glossed inline (per the JARGON RULE above).
+- **Where it stands:** Trial phase, approval status, AND current recruitment status — in plain words. If it's not actually available right now, say so first.
+- **Who it's for:** Eligibility translated into "you might be eligible if you …" language. Mention any major exclusions (e.g., "won't work if you already have a tracheostomy").
+- **If you want to explore this:**
+  - Bring trial ID `NCTxxxx` (or PMID/DOI) to your next ALS clinic visit
+  - The exact question to ask, in quotes (e.g., "Is the Paris site of DAZALS open to new patients?")
+  - The CURRENT recruitment status at the nearest France/Europe site, by name (specific hospital + city)
+  - Honest fallback if not accessible: compassionate use, a sister trial, the patient association (ARSLA), or "wait until next year"
+```
+
+**CONTRADICTION RULE.** If tool results contradict themselves (e.g., "recruiting" in one field, "active, not recruiting" in another), name the contradiction clearly in the "Where it stands" section and tell the patient what to verify. Do NOT cherry-pick the rosier option.
+
+**NO REDUNDANT TAILS.** Do not end every single "If you want to explore this" block with the same "If unavailable, consult your local neurologist" or similar boilerplate. Say it ONCE — at the very end of the response, as a single footer line before the MEMORY UPDATE (e.g., "If none of these options are accessible to you, your local neurologist can review this list with you and help identify alternatives."). Per-treatment action blocks should be specific to that treatment, not copy-paste fallback text.
+
+=== GEOGRAPHY (STRONG BIAS) ===
+The user is based in **{_user_location}**. When listing clinical trials:
+- Surface trials with sites in {_user_location} FIRST, then neighboring countries (UK, Germany, Belgium, Netherlands, Italy, Spain, Switzerland) SECOND, then the US/rest of world LAST.
+- If a trial has a site in {_user_location} or nearby, name the specific hospital/city.
+- If no relevant trials are in Europe, say so explicitly (don't bury the user in US-only options without flagging it).
+- Use `find_trials_near_me` with {_user_location} coordinates to surface local options — don't just list whatever AACT returns.
+
+**FRANCE ANCHOR LIST (use these in action-step blocks).** When pointing a French patient to next steps, name real-world entry points by name — not just trial IDs:
+- **ARSLA** ([arsla.org](https://www.arsla.org/)) — the French ALS patient association. They maintain a directory of all French Centres de référence SLA and can help locate trials, connect families with those centers, and explain compassionate-use options. Mention them in at least one action-step block per response.
+- **Named French ALS centers** (any of these is a reasonable next-visit destination for a French patient): Pitié-Salpêtrière (Paris), Hôpital Pierre Wertheimer (Lyon), CHU de Tours, CHU de Lille, La Timone (Marseille), CHU de Montpellier, CHU de Nice, CHU de Limoges, CHU de Bordeaux, CHU de Nancy.
+- **Filnemus** — French rare neuromuscular disease consortium (worth mentioning for genetic/familial ALS questions).
+- For trials with a Paris site, default to "Pitié-Salpêtrière" as the named center unless the trial data specifies a different Paris hospital.
+
+**DO NOT include phone numbers, street addresses, or specific contact emails for French centers** (or any other centers). Those details change, and you cannot verify them — citing a wrong phone number is worse than not citing one. Point the patient to ARSLA's directory instead: "find your nearest Centre de référence SLA via ARSLA's directory at arsla.org." URL-only references to arsla.org are fine (they're verifiable).
+
+**Pick ONE named center per response, not one per treatment.** If a response covers 5 supplements or trials, don't rotate through 5 different French centers as if each supplement is tied to a specific one. Either name one default center (Pitié-Salpêtrière unless the patient's question suggests otherwise) in a single footer, or name the center that's actually tied to the specific trial's French site.
+
+CURRENT DATE: {_today}
+- NEVER write a date later than today. If a tool result contains a date that seems from the future, it's a data timestamping quirk — do not amplify it.
+- "Last 6 months" means the 180 days BEFORE today, not any month after today.
+
+ANTI-FABRICATION RULES (strict):
+- Every NCT ID, PMID, or DOI you cite MUST come from an actual tool result in this conversation. Do NOT write "NCT07XXXXXX" or similar plausible-looking IDs from memory.
+- If you want to reference a trial or paper you didn't verify via tools, either call `get_trial_details` / `get_paper_details` to confirm it first, or write "(not independently verified)" beside it.
+- Every cited paper must include a URL so the user can check it: `https://pubmed.ncbi.nlm.nih.gov/PMID/` for PMIDs, `https://clinicaltrials.gov/study/NCTID` for trials, `https://doi.org/DOI` for preprints.
+- If you are uncertain about a specific detail (year, author, result), say "uncertain" — do not invent.
 
 SEARCH RULES: ALWAYS include "ALS" or "amyotrophic lateral sclerosis" in every search query.
 
@@ -716,17 +818,22 @@ Follow these phases in order. Each phase marker must be bold on its own line (e.
 
         base_prompt += """
 
-4. **✅ SYNTHESIS:** Comprehensive answer with:
+4. **✅ SYNTHESIS:** REQUIRED final section. The literal `**✅ SYNTHESIS:**` header MUST appear on its own line. The answer section MUST include:
+   - **Opening sentence: lead with evidence, not bleakness.** This is a patient, not a meta-analysis. Do NOT open with "The evidence is disappointing" or "Most treatments have failed" — even when that's arguably true. Instead: lead with what DOES have evidence (even if thin), THEN cover what's been tried and failed. A good opening: "A few nutritional approaches have real evidence worth knowing about — here they are, followed by the ones that sounded promising but didn't pan out." If nothing at all has positive evidence, say "No approved treatments have shown strong benefit yet, but several are in active trials — here's what's currently being tested."
    - Direct answer to the question
+   - **Maximum 5 detailed treatment/trial entries.** If you found more, list the top 5 and end with: "I found N more candidates — ask me about [topic A] or [topic B] if you want details on those." Patients don't read past 5.
+   - **Ordering: positive/promising evidence FIRST, negative/failed second, experimental/unknown last.** Leading with four red-flagged "not recommended" entries demoralizes the patient and is often factually incomplete (you probably missed the positive-signal interventions — see the OPEN-ENDED query rule in CLINICAL TRIALS).
+   - Each treatment/trial entry MUST follow the four-section per-treatment template defined in the AUDIENCE section (What it is / Where it stands / Who it's for / If you want to explore this).
    - Numbered citations [1], [2] with clickable URLs (PubMed: https://pubmed.ncbi.nlm.nih.gov/PMID/, trials: https://clinicaltrials.gov/study/NCTID)
-   - Confidence scoring: 🟢 High (multiple peer-reviewed studies), 🟡 Moderate (limited/preprint), 🔴 Low (single study/theoretical)
+   - Confidence tags on major claims: 🟢 High (multiple peer-reviewed studies), 🟡 Moderate (limited/preprint), 🔴 Low (single study/theoretical) — apply per claim, not just in a final summary
    - If searches failed: state limitations and provide knowledge-based answer
-   - Suggested follow-up questions"""
+   - End with one or two suggested follow-up questions the patient could ask
+   - Do NOT add a "Clinical Considerations" / "Most accessible for X" / "Best for Y" comparison section — those are clinician summaries. The per-treatment "Who it's for" already covers eligibility from the patient angle."""
 
         if enable_rag:
             base_prompt += """
 
-5. **📚 MEMORY UPDATE:** One-line summary: "Indexed N new papers | M already in memory | Topic: [topic]"."""
+5. **📚 MEMORY UPDATE:** REQUIRED final line. The literal `**📚 MEMORY UPDATE:**` header must appear on its own line, followed by a ONE-LINE honest summary. Use **"Reviewed"** if you only fetched papers/trials this session; use **"Indexed"** ONLY if you actually called `llamaindex__index_paper` to save them to long-term memory. Format: `Reviewed N papers | M trials | Topic: [topic]` OR `Indexed N new papers | Reviewed M papers | Topic: [topic]` if you indexed any. Do NOT say "Indexed" when you didn't call the index tool — it's misleading."""
 
         base_prompt += """
 
@@ -743,7 +850,29 @@ Follow these phases in order. Each phase marker must be bold on its own line (e.
 - GENERAL SEARCH: aact__search_als_trials — search by status, phase, intervention. Use uppercase status: RECRUITING, COMPLETED, etc.
 - FALLBACK: trials_links__get_known_als_trials — curated list of important ALS trials.
 
-IMPORTANT: When the user asks about trials near a location, ALWAYS use find_trials_near_me (not search_als_trials with location filter).
+IMPORTANT LOCATION RULES:
+- For ANY location-based trial query, use ONLY find_trials_near_me. Do NOT also call search_als_trials with a location — it will return 0 results for countries/regions.
+- For "Europe" queries: find_trials_near_me with latitude=48.86, longitude=2.35 (Paris), radius_miles=500, max_results=30.
+- For "USA" / "U.S.A." / "North America" queries: find_trials_near_me with latitude=39.83, longitude=-98.58 (geographic center of US), radius_miles=500, max_results=30. For East Coast: latitude=38.9, longitude=-77.0 (DC), radius_miles=500. For North America add a second search with latitude=45.5, longitude=-73.6 (Montreal), radius_miles=500 to cover Canada.
+- For specific countries: find_trials_near_me with the capital city coordinates and radius_miles=300.
+- For US regions: find_trials_near_me with city name or ZIP code, radius_miles=200.
+- search_als_trials is ONLY for non-location queries (e.g., filter by phase, intervention, status).
+
+NAMED-INTERVENTION RULE (mandatory):
+When the user names a specific drug, supplement, gene, or intervention (e.g., "ALCAR", "acetyl-L-carnitine", "tofersen", "vitamin D", "stem cells", "masitinib", "edaravone"), the EXECUTING phase MUST include `search_als_trials(intervention="<name>")` — even if PubMed and semantic_search are also called. PubMed alone will miss trials that haven't published results yet.
+- The server already expands common synonyms (ALCAR ↔ acetyl-L-carnitine, tofersen ↔ BIIB067, AMX0035 ↔ Relyvrio, NurOwn ↔ MSC-NTF, CoQ10 ↔ ubiquinone, etc.) — you don't need to manually try every variant.
+- **If `status="RECRUITING"` (the default) returns 0, ALSO try `status="ACTIVE_NOT_RECRUITING"` and `status="COMPLETED"`.** A drug may have completed trials with published results even if no recruiting trial is currently open — this is still useful for the patient to understand the drug's track record. Always say in the response which status returned the result so the patient knows whether they can join.
+
+OPEN-ENDED SUPPLEMENT/TREATMENT QUERIES (mandatory coverage):
+When the user asks an open-ended question like "what supplements are recommended", "best treatments for ALS", "what should I try", or similar — do NOT only list whatever PubMed surfaces. You MUST explicitly search for each of these **known-signal interventions** (because missing a supplement with positive evidence is worse than listing too many):
+- `acetyl-L-carnitine` (ALCAR) — 2013 Beghi RCT doubled median survival; NCT06126315 is actively recruiting as a Phase 2/3 confirmatory trial
+- `omega-3` or `DHA` — DHA has neuroprotective signals; EPA may be harmful — this nuance matters
+- `high caloric` or `fat-rich` (search PubMed for "high caloric ALS" or "fat-rich ALS") — 2022 RCT (PMID 35022317) showed survival benefit from high-caloric/fatty supplementation
+- `vitamin D` — mixed/negative evidence but commonly asked about
+- `creatine` — negative trials but a high-awareness supplement
+- `CoQ10` (ubiquinone) — negative trials but frequently asked about
+
+**Ordering rule for open-ended queries**: in the synthesis, list supplements with POSITIVE or PROMISING evidence FIRST (ALCAR, omega-3/DHA, high-caloric supplementation), then the ones tried-and-failed. Leading with four red-flagged "not recommended" entries sends a demoralizing signal that's also factually incomplete.
 
 === SELF-CORRECTION ===
 If zero results: broaden terms, try synonyms, search related concepts. State what you tried.
@@ -895,6 +1024,8 @@ Keep your response friendly and informative."""
         # Initial API call with streaming using helper function
         full_response = ""
         tool_calls = []
+        # Accumulate every tool result string for the post-synthesis citation verifier
+        all_tool_result_texts: list = []
 
         # Use the stream_with_retry helper to handle all retry logic
         provider_used = "Anthropic Claude"  # Track which provider
@@ -976,6 +1107,11 @@ Keep your response friendly and informative."""
                 "content": tool_results_content
             })
 
+            # Track raw tool result text for the citation verifier whitelist
+            for item in tool_results_content:
+                if isinstance(item, dict) and isinstance(item.get("content"), str):
+                    all_tool_result_texts.append(item["content"])
+
             # Smart reflection: Only add reflection prompt if results seem incomplete
             needs_reflection = False  # Default for tool_iteration > 1
             if tool_iteration == 1:
@@ -1024,17 +1160,36 @@ Keep your response friendly and informative."""
                     # High confidence - skip reflection and go straight to synthesis
                     logger.info(f"Skipping reflection - high confidence (low_conf:{low_conf_count}, high_conf:{high_conf_count}, results:{total_results})")
                     synthesis_prompt = [
-                        {"type": "text", "text": "\n\nResults look comprehensive. Provide your **✅ SYNTHESIS:** now with the complete answer."}
+                        {"type": "text", "text": (
+                            "\n\nResults look comprehensive. Now produce the final answer with these MANDATORY rules:\n"
+                            "1. Start with the header `**✅ SYNTHESIS:**` on its own line\n"
+                            "2. EVERY treatment/trial entry MUST follow the four-section per-treatment template from the AUDIENCE section: **What it is** / **Where it stands** / **Who it's for** / **If you want to explore this** (with NCT ID + question to ask + named French center + fallback). Do NOT use 'Mechanism' / 'Status' / 'Eligibility' / 'Sites' as labels.\n"
+                            "3. Maximum 5 treatments. If more, end the list with: 'I found N more — ask me about [X] or [Y] for those.'\n"
+                            "4. Use confidence tags per claim: 🟢 / 🟡 / 🔴 . Apply the JARGON RULE inline (gloss every technical term).\n"
+                            "5. End with `**📚 MEMORY UPDATE:**` on its own line. Use 'Reviewed N papers / M trials' — do NOT say 'Indexed' unless you actually called llamaindex__index_paper.\n"
+                            "6. Do NOT add a 'Clinical Considerations' or 'Most accessible for X' summary section after the treatments.\n"
+                        )}
                     ]
                     messages.append({
                         "role": "user",
                         "content": synthesis_prompt
                     })
             else:
-                # Subsequent iterations (tool_iteration > 1) - UPDATE existing synthesis without repeating workflow phases
-                logger.info(f"Iteration {tool_iteration}: Updating synthesis with additional results")
+                # Subsequent iterations (tool_iteration > 1) — the agent already
+                # emitted PLANNING/EXECUTING/REFLECTING on iteration 1. Don't
+                # repeat those, but DO emit SYNTHESIS + MEMORY UPDATE markers
+                # for the final answer.
+                logger.info(f"Iteration {tool_iteration}: finalizing with synthesis + memory update markers")
                 update_prompt = [
-                    {"type": "text", "text": "\n\n**ADDITIONAL RESULTS:** You have gathered more information. Please UPDATE your previous synthesis by integrating these new findings. Do NOT repeat the planning/executing/reflecting phases - just provide an updated synthesis that incorporates both the previous and new information. Continue directly with the updated content, no phase markers needed."}
+                    {"type": "text", "text": (
+                        "\n\nYou now have all the information you need. Produce the FINAL answer (do NOT redo planning/executing/reflecting):\n"
+                        "1. Start with `**✅ SYNTHESIS:**` on its own line\n"
+                        "2. EVERY treatment/trial MUST use the four-section per-treatment template: **What it is** / **Where it stands** / **Who it's for** / **If you want to explore this** (with NCT/PMID + question to ask + named French center via ARSLA/Pitié-Salpêtrière/etc + fallback). Do NOT use 'Mechanism' / 'Status' / 'Eligibility' as labels.\n"
+                        "3. Maximum 5 treatments. If more found, end the list with: 'I found N more — ask me about [X] or [Y].'\n"
+                        "4. Confidence tags 🟢 / 🟡 / 🔴 per claim. Apply JARGON RULE inline.\n"
+                        "5. End with `**📚 MEMORY UPDATE:**` and an honest summary ('Reviewed N papers / M trials' — only 'Indexed' if you actually called llamaindex__index_paper).\n"
+                        "6. Do NOT add a 'Clinical Considerations' / 'Most accessible for X' / 'Best for Y' comparison section.\n"
+                    )}
                 ]
                 messages.append({
                     "role": "user",
@@ -1055,25 +1210,34 @@ Keep your response friendly and informative."""
             synthesis_response = ""
             additional_tool_calls = []
 
-            # For subsequent iterations, use modified system prompt that doesn't require all phases
+            # For subsequent iterations, use a system prompt that prevents
+            # re-running PLANNING/EXECUTING/REFLECTING (already emitted in iter 1)
+            # but STILL requires the final SYNTHESIS + MEMORY UPDATE markers.
             iteration_system_prompt = system_prompt
             if tool_iteration > 1:
-                iteration_system_prompt = """You are an AI assistant specializing in ALS (Amyotrophic Lateral Sclerosis) research.
+                iteration_system_prompt = """You are ALSARA, an expert ALS research assistant producing the final answer.
 
-You are continuing your research with additional results. Please integrate the new findings into an updated response.
+You already completed PLANNING, EXECUTING, and REFLECTING in the previous turn. Do NOT repeat those phases.
 
-IMPORTANT: Do NOT repeat the workflow phases (Planning/Executing/Reflecting/Synthesis) - you've already done those.
-Simply provide updated content that incorporates both previous and new information.
-Start your response directly with the updated information, no phase markers needed."""
+Your job now is to produce the FINAL ANSWER with these MANDATORY markers:
+1. **✅ SYNTHESIS:** on its own line, followed by the full answer
+2. Throughout the answer, tag each claim with confidence: 🟢 High / 🟡 Moderate / 🔴 Low
+3. **📚 MEMORY UPDATE:** on its own line at the end, followed by a ONE-LINE summary
 
-            # Smart tool selection: no tools when we expect synthesis, tools when reflection needed
-            if tool_iteration > 1:
-                available_tools = []  # No more tools after first iteration
-            elif needs_reflection:
-                available_tools = tools  # Reflection may need additional searches
-            else:
-                available_tools = []  # High confidence → synthesis only, no tools needed
+Include every citation with a clickable URL (PubMed: https://pubmed.ncbi.nlm.nih.gov/PMID/, trials: https://clinicaltrials.gov/study/NCTID).
+NEVER invent NCT IDs, PMIDs, or DOIs. Every citation must come from a tool result you actually received."""
 
+            # Tool availability: keep tools on iteration 1 so the model can
+            # dig deeper if it wants to, then lock them down on iteration 2+
+            # to force synthesis. Previously we stripped tools on "high confidence"
+            # — but when the initial response ended with "let me get more details",
+            # the model then returned an empty reply because it had nothing to do.
+            available_tools = tools if tool_iteration == 1 else []
+
+            # Track a "baseline" of the accumulated response so we can yield
+            # incrementally during streaming. This keeps the HF Spaces SSE
+            # connection alive (idle proxy timeout ~30s).
+            baseline = full_response
             async for response_text, current_tool_calls, provider_used in stream_with_retry(
                 client=client,
                 messages=messages,
@@ -1086,10 +1250,10 @@ Start your response directly with the updated information, no phase markers need
             ):
                 synthesis_response = response_text
                 additional_tool_calls = current_tool_calls
+                # Yield per-chunk so the browser keeps receiving data.
+                yield filter_internal_tags(baseline + synthesis_response)
 
             full_response += synthesis_response
-            # Yield the full accumulated response including planning, execution, and synthesis
-            yield filter_internal_tags(full_response)
 
             # Check for additional tool calls
             if additional_tool_calls:
@@ -1109,6 +1273,7 @@ Start your response directly with the updated information, no phase markers need
 
                     # Make one final API call to synthesize all the results
                     final_synthesis = ""
+                    baseline = full_response
                     async for response_text, _, provider_used in stream_with_retry(
                         client=client,
                         messages=messages,
@@ -1120,10 +1285,9 @@ Start your response directly with the updated information, no phase markers need
                         stream_name="final synthesis"
                     ):
                         final_synthesis = response_text
+                        yield filter_internal_tags(baseline + final_synthesis)
 
                     full_response += final_synthesis
-                    # Yield the full accumulated response
-                    yield filter_internal_tags(full_response)
 
                     # Clear tool_calls to exit the loop gracefully
                     tool_calls = []
@@ -1157,6 +1321,11 @@ Start your response directly with the updated information, no phase markers need
                         "content": tool_results_content
                     })
 
+                    # Accumulate tool result text for the verifier whitelist
+                    for item in tool_results_content:
+                        if isinstance(item, dict) and isinstance(item.get("content"), str):
+                            all_tool_result_texts.append(item["content"])
+
                     # Set tool_calls for next iteration
                     tool_calls = additional_tool_calls
             else:
@@ -1173,7 +1342,38 @@ Start your response directly with the updated information, no phase markers need
             # Don't make an extra API call — the response likely has the answer already,
             # just without the exact marker. The condensed prompt should prevent this.
 
-        # No final yield needed - response has already been yielded incrementally
+        # --- Post-synthesis citation verification ---
+        # Deterministically check every NCT/PMID/DOI in the final response:
+        #   1. Against IDs that actually appeared in tool results this session
+        #      (catches hallucinated IDs without any network call)
+        #   2. Against canonical registries (ClinicalTrials.gov, PubMed, doi.org)
+        # If anything fails, append a warning block so the user can't miss it.
+        try:
+            from citation_verifier import (
+                verify_citations,
+                collect_ids_from_tool_results,
+                format_verification_block,
+            )
+            whitelist = collect_ids_from_tool_results(all_tool_result_texts)
+            verifications = await asyncio.wait_for(
+                verify_citations(full_response, tool_result_ids=whitelist),
+                timeout=15.0,
+            )
+            warning_block = format_verification_block(verifications)
+            if warning_block:
+                full_response += "\n\n" + warning_block
+                yield filter_internal_tags(full_response)
+                flagged = sum(1 for v in verifications if v.status in ("not_from_search", "not_found"))
+                logger.warning(
+                    f"Citation verification flagged {flagged} citation(s) "
+                    f"out of {len(verifications)} total"
+                )
+            else:
+                logger.info(f"All {len(verifications)} citations verified OK")
+        except asyncio.TimeoutError:
+            logger.warning("Citation verification timed out — skipping")
+        except Exception as e:
+            logger.warning(f"Citation verification failed (non-fatal): {e}")
 
         # Record successful response time
         response_time = time.time() - start_time
@@ -1205,8 +1405,37 @@ async def main() -> None:
         logger.error(f"Failed to initialize MCP servers: {e}", exc_info=True)
         raise
     
+    # Auth config
+    app_user = os.environ.get("APP_USERNAME")
+    app_pass = os.environ.get("APP_PASSWORD")
+    auth_required = bool(app_user and app_pass)
+    _failed_attempts = {}
+    _max_attempts = 5
+    _lockout_seconds = 300
+
     # Create Gradio interface with export button
     with gr.Blocks() as demo:
+        # Authentication state: True if logged in OR using own API key
+        is_authenticated = gr.State(value=not auth_required)
+        user_api_key = gr.State(value=None)  # If user provides their own Anthropic key
+
+        # --- Login screen (in-app, works on mobile) ---
+        with gr.Column(visible=auth_required) as login_screen:
+            gr.Markdown("# 🧬 ALSARA — Access")
+            gr.Markdown(
+                "Enter the shared credentials, **or** use your own Anthropic API key "
+                "(your queries will be billed to your account)."
+            )
+            with gr.Row():
+                login_user = gr.Textbox(label="Username", scale=1)
+                login_pass = gr.Textbox(label="Password", type="password", scale=1)
+            login_btn = gr.Button("Log in with password", variant="primary")
+
+            gr.Markdown("**OR** use your own Anthropic API key:")
+            login_key = gr.Textbox(label="Anthropic API Key", placeholder="sk-ant-...", type="password")
+            login_key_btn = gr.Button("Use my API key", variant="secondary")
+            login_msg = gr.Markdown("")
+
         gr.Markdown("# 🧬 ALSARA - ALS Agentic Research Assistant ")
         gr.Markdown("Ask questions about ALS research, treatments, and clinical trials. This agent searches PubMed, AACT clinical trials database, and other sources in real-time.")
 
@@ -1219,7 +1448,6 @@ async def main() -> None:
                 chatbot = gr.Chatbot(
                     height=600,
                     show_label=False,
-                    allow_tags=True,  # Allow custom HTML tags from LLMs (Gradio 6 default)
                     elem_classes="chatbot-container"
                 )
 
@@ -1285,20 +1513,36 @@ async def main() -> None:
 
         gr.Examples(
             examples=[
+                "ALS clinical trials in Europe",
+                "ALS clinical trials in the U.S.A.",
                 "Find Phase 2/3 ALS trials near Paris, France",
                 "New ALS trials posted in the last 30 days",
-                "Tofersen clinical trial status",
+                "Most promising new ALS treatments in the last 6 months",
+                "Trials testing acetyl-L-carnitine (ALCAR) for ALS",
                 "What supplements are recommended for ALS?",
                 "Omega-3 and vitamin D in ALS treatment",
-                "SOD1-targeted therapies in recent preprints",
+                "Tofersen clinical trial status",
             ],
             inputs=msg,
-            examples_per_page=6,
+            examples_per_page=9,
         )
 
         # Chat interface logic with improved error handling
-        async def respond(message: str, history: Optional[List[Dict[str, str]]]) -> AsyncGenerator[List[Dict[str, str]], None]:
+        async def respond(message: str, history: Optional[List[Dict[str, str]]], authed: bool, api_key: Optional[str]) -> AsyncGenerator[List[Dict[str, str]], None]:
             history = history or []
+
+            # Gate queries until the user has authenticated
+            if auth_required and not authed:
+                history.append({"role": "user", "content": message})
+                history.append({"role": "assistant", "content": "🔒 Please log in at the top of the page to use the assistant."})
+                yield history
+                return
+
+            # If user provided their own API key, temporarily swap it in for this request
+            original_key = os.environ.get("ANTHROPIC_API_KEY")
+            if api_key:
+                os.environ["ANTHROPIC_API_KEY"] = api_key
+
             # Append user message
             history.append({"role": "user", "content": message})
             # Append empty assistant message
@@ -1315,6 +1559,9 @@ async def main() -> None:
                 error_msg = f"❌ Error: {str(e)}"
                 history[-1]['content'] = error_msg
                 yield history
+            finally:
+                if api_key and original_key:
+                    os.environ["ANTHROPIC_API_KEY"] = original_key
 
         def update_speak_button():
             """Update the speak button state based on last_response_was_research"""
@@ -1659,7 +1906,7 @@ async def main() -> None:
                 )
 
         msg.submit(
-            respond, [msg, chatbot], [chatbot],
+            respond, [msg, chatbot, is_authenticated, user_api_key], [chatbot],
             api_name="chat"
         ).then(
             update_speak_button, None, [speak_btn]
@@ -1678,7 +1925,7 @@ async def main() -> None:
         # )
 
         submit_btn.click(
-            respond, [msg, chatbot], [chatbot],
+            respond, [msg, chatbot, is_authenticated, user_api_key], [chatbot],
             api_name="chat_button"
         ).then(
             update_speak_button, None, [speak_btn]
@@ -1711,6 +1958,52 @@ async def main() -> None:
             api_name="export"
         )
 
+        # --- Login handlers (hide the login screen once authenticated) ---
+        def do_login_password(username, password):
+            import time as _time
+            now = _time.time()
+            key = (username or "").lower().strip()
+            if key in _failed_attempts:
+                count, last = _failed_attempts[key]
+                if count >= _max_attempts and (now - last) < _lockout_seconds:
+                    remaining = int(_lockout_seconds - (now - last))
+                    return (gr.update(), True, None, f"⏱️ Too many failed attempts. Try again in {remaining}s.")
+            if username == app_user and password == app_pass:
+                _failed_attempts.pop(key, None)
+                logger.info(f"Login success: {key}")
+                return (gr.update(visible=False), True, None, "")
+            cnt = _failed_attempts.get(key, (0, 0))[0] + 1
+            _failed_attempts[key] = (cnt, now)
+            logger.warning(f"Failed login: {key} ({cnt}/{_max_attempts})")
+            return (gr.update(), False, None, f"❌ Invalid credentials ({cnt}/{_max_attempts})")
+
+        def do_login_api_key(api_key):
+            if not api_key or not api_key.strip().startswith("sk-ant-"):
+                return (gr.update(), False, None, "❌ Invalid API key format. Should start with 'sk-ant-'.")
+            logger.info("User provided their own API key")
+            return (gr.update(visible=False), True, api_key.strip(), "")
+
+        login_btn.click(
+            do_login_password,
+            inputs=[login_user, login_pass],
+            outputs=[login_screen, is_authenticated, user_api_key, login_msg],
+        )
+        login_pass.submit(
+            do_login_password,
+            inputs=[login_user, login_pass],
+            outputs=[login_screen, is_authenticated, user_api_key, login_msg],
+        )
+        login_key_btn.click(
+            do_login_api_key,
+            inputs=[login_key],
+            outputs=[login_screen, is_authenticated, user_api_key, login_msg],
+        )
+        login_key.submit(
+            do_login_api_key,
+            inputs=[login_key],
+            outputs=[login_screen, is_authenticated, user_api_key, login_msg],
+        )
+
         # Voice output event handler (disabled)
         # speak_btn.click(
         #     speak_last_response, [chatbot], [audio_row, audio_output],
@@ -1724,50 +2017,11 @@ async def main() -> None:
         # Use environment variable for port, default to 7860 for HuggingFace
         port = int(os.environ.get("GRADIO_SERVER_PORT", 7860))
 
-        # Optional password protection with brute-force lockout
-        auth = None
-        app_user = os.environ.get("APP_USERNAME")
-        app_pass = os.environ.get("APP_PASSWORD")
-        if app_user and app_pass:
-            _failed_attempts = {}  # ip-free tracker: {username: (count, last_attempt_time)}
-            _max_attempts = 5
-            _lockout_seconds = 300  # 5 minute lockout after 5 failures
-
-            def auth_with_lockout(username, password):
-                now = time.time()
-                key = username.lower().strip()
-
-                # Check lockout
-                if key in _failed_attempts:
-                    count, last_time = _failed_attempts[key]
-                    if count >= _max_attempts and (now - last_time) < _lockout_seconds:
-                        remaining = int(_lockout_seconds - (now - last_time))
-                        logger.warning(f"Auth locked out for '{key}' — {remaining}s remaining")
-                        return False
-
-                # Check credentials
-                if username == app_user and password == app_pass:
-                    _failed_attempts.pop(key, None)  # Clear on success
-                    return True
-
-                # Track failure
-                if key in _failed_attempts:
-                    count, _ = _failed_attempts[key]
-                    _failed_attempts[key] = (count + 1, now)
-                else:
-                    _failed_attempts[key] = (1, now)
-                logger.warning(f"Failed login attempt for '{key}' ({_failed_attempts[key][0]}/{_max_attempts})")
-                return False
-
-            auth = auth_with_lockout
-            logger.info(f"Password protection enabled (lockout after {_max_attempts} failures for {_lockout_seconds}s)")
-
         demo.launch(
             server_name="0.0.0.0",
             server_port=port,
             share=False,
-            auth=auth,
-            ssr_mode=False  # Disable SSR for compatibility with async initialization
+            ssr_mode=False,
         )
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt, shutting down...")
