@@ -94,3 +94,10 @@ dmypy.json
 
 # ── Archive ─────────────────────────────────────────────────────────────────
 archive/
+
+# ── Claude Code local state ─────────────────────────────────────────────────
+.claude/
+
+# ── Internal notes (not for the public repo) ────────────────────────────────
+NOTES.md
+TODO.md

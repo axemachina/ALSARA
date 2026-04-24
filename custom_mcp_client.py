@@ -33,7 +33,7 @@ class MCPClient:
             [sys.executable, self.server_script],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=None,  # Inherit parent stderr so subprocess logs surface in Space logs
             text=True,
             bufsize=1  # Line-buffered I/O to prevent 8KB truncation
         )

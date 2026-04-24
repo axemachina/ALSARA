@@ -55,6 +55,57 @@ logger = logging.getLogger(__name__)
 # Initialize MCP server
 mcp = FastMCP("aact-database")
 
+# Intervention synonym map — AACT stores trials with a single canonical
+# intervention name (e.g., "Acetyl-l-carnitine"), so a search for the common
+# abbreviation "ALCAR" never matches. Each key gets expanded into an OR-search
+# across all listed forms (lowercased, substring match).
+_INTERVENTION_SYNONYMS = {
+    # ALS supplements / nutritional
+    "alcar": ["acetyl-l-carnitine", "acetyl l carnitine", "levocarnitine", "acetylcarnitine"],
+    "acetyl-l-carnitine": ["alcar", "levocarnitine", "acetylcarnitine"],
+    "carnitine": ["acetyl-l-carnitine", "alcar", "levocarnitine"],
+    "vitamin d": ["cholecalciferol", "ergocalciferol", "vitamin d3", "vitamin d2", "calcitriol"],
+    "omega-3": ["dha", "epa", "docosahexaenoic", "eicosapentaenoic", "fish oil"],
+    "omega 3": ["dha", "epa", "docosahexaenoic", "eicosapentaenoic", "fish oil"],
+    "coenzyme q10": ["coq10", "ubiquinone", "ubiquinol"],
+    "coq10": ["coenzyme q10", "ubiquinone", "ubiquinol"],
+    "creatine": ["creatine monohydrate"],
+    # Approved + emerging ALS drugs (research code ↔ brand/generic)
+    "tofersen": ["biib067", "qalsody"],
+    "biib067": ["tofersen", "qalsody"],
+    "qalsody": ["tofersen", "biib067"],
+    "edaravone": ["radicava", "mci-186"],
+    "radicava": ["edaravone"],
+    "amx0035": ["relyvrio", "albrioza", "sodium phenylbutyrate", "taurursodiol", "tudca"],
+    "relyvrio": ["amx0035", "sodium phenylbutyrate", "taurursodiol"],
+    "masitinib": ["ab1010"],
+    "reldesemtiv": ["ck-2127107", "ck2127107"],
+    "ck-2127107": ["reldesemtiv"],
+    "arimoclomol": [],
+    "pridopidine": [],
+    "ravulizumab": ["ultomiris"],
+    "cnm-au8": ["cnmau8", "gold nanocrystal"],
+    "cuatsm": ["copper-atsm", "copper atsm"],
+    "verdiperstat": ["bhv-3241", "azd3241"],
+    "zilucoplan": [],
+    "ezogabine": ["retigabine"],
+    # Cell therapies
+    "nurown": ["msc-ntf", "debamestrocel"],
+    "msc-ntf": ["nurown", "debamestrocel"],
+    # Riluzole forms
+    "riluzole": ["rilutek", "tiglutik", "exservan"],
+}
+
+
+def _expand_intervention_synonyms(intervention: str) -> list[str]:
+    """Return all known forms of an intervention (lowercase, deduped)."""
+    key = intervention.lower().strip()
+    forms = {key}
+    if key in _INTERVENTION_SYNONYMS:
+        forms.update(_INTERVENTION_SYNONYMS[key])
+    return sorted(forms)
+
+
 # Database configuration
 AACT_HOST = os.getenv("AACT_HOST", "aact-db.ctti-clinicaltrials.org")
 AACT_PORT = os.getenv("AACT_PORT", "5432")
@@ -230,9 +281,15 @@ async def search_als_trials(
             param_count += 1
 
         if intervention:
-            conditions.append(f"LOWER(i.name) LIKE ${param_count}")
-            params.append(f"%{intervention.lower()}%")
-            param_count += 1
+            # Expand abbreviations (e.g. ALCAR → acetyl-l-carnitine) so a search
+            # for the abbreviation matches the canonical name AACT actually stores.
+            forms = _expand_intervention_synonyms(intervention)
+            like_clauses = []
+            for form in forms:
+                like_clauses.append(f"LOWER(i.name) LIKE ${param_count}")
+                params.append(f"%{form}%")
+                param_count += 1
+            conditions.append("(" + " OR ".join(like_clauses) + ")")
 
         if location:
             base_query = base_query.replace("LEFT JOIN facilities f", "INNER JOIN facilities f")
@@ -464,7 +521,7 @@ async def find_trials_near_me(
     radius_miles: int = 200,
     status: str = "RECRUITING",
     subtype: Optional[str] = None,
-    max_results: int = 15,
+    max_results: int = 25,
 ) -> str:
     """Find ALS clinical trials near a location. Provide EITHER zip_code, city+state, OR latitude+longitude.
 
