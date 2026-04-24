@@ -7,6 +7,13 @@ This server enables the agent to remember all research it encounters, build
 knowledge over time, and discover connections between papers.
 """
 
+import sys
+# Diagnostic marker written before ANY other imports — tests whether this
+# subprocess's stderr reaches the Space log stream. Uses sys.__stderr__ so no
+# later redirection can suppress it.
+sys.__stderr__.write("[LLAMAINDEX-SERVER] module boot marker reached\n")
+sys.__stderr__.flush()
+
 from mcp.server.fastmcp import FastMCP
 import logging
 import os
@@ -14,7 +21,6 @@ import json
 import hashlib
 from typing import Optional, List, Dict, Any
 from pathlib import Path
-import sys
 from datetime import datetime
 import asyncio
 
@@ -23,11 +29,23 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from shared import config
 
-# Configure logging — force=True overrides any root handler installed by FastMCP/anyio
-# at import time. Without force=True the basicConfig call is a no-op and INFO logs
-# from this module never surface in the Space log output.
-logging.basicConfig(level=logging.INFO, force=True)
+# Configure logging. Two strategies stacked so logs surface even if one path
+# is blocked:
+#   1. StreamHandler(sys.__stderr__) — bypasses anything that reassigns sys.stderr
+#   2. FileHandler to the same app.log the parent writes to — picked up by HF
+# force=True drops any prior root handler (e.g. FastMCP's configure_logging()).
+_APP_LOG_PATH = "/app/app.log" if Path("/app").exists() else "app.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    force=True,
+    handlers=[
+        logging.StreamHandler(sys.__stderr__),
+        logging.FileHandler(_APP_LOG_PATH, mode="a", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger(__name__)
+logger.info("llamaindex_server logging initialized (log file: %s)", _APP_LOG_PATH)
 
 # Initialize MCP server
 mcp = FastMCP("llamaindex-rag")
