@@ -23,7 +23,8 @@ from shared.http_client import CustomHTTPClient
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    force=True,  # Override root handler installed by FastMCP at import time
 )
 logger = logging.getLogger(__name__)
 

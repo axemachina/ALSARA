@@ -48,8 +48,9 @@ except ImportError:
 
 from mcp.server.fastmcp import FastMCP
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup logging — force=True ensures this overrides any root handler installed
+# by FastMCP/anyio at import time; without it INFO logs don't reach Space logs.
+logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger(__name__)
 
 # Initialize MCP server
