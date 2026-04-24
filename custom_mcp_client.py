@@ -8,6 +8,7 @@ import json
 import logging
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -29,18 +30,43 @@ class MCPClient:
         """Start the MCP server subprocess"""
         logger.info(f"Starting MCP server: {self.server_name}")
 
+        # HF Spaces does not capture subprocess stderr even when inherited,
+        # so we capture via PIPE and relay each line through the parent
+        # process's logger (which we've confirmed does reach Space logs).
         self.process = subprocess.Popen(
             [sys.executable, self.server_script],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,  # Inherit parent stderr so subprocess logs surface in Space logs
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1  # Line-buffered I/O to prevent 8KB truncation
         )
+        self._start_stderr_forwarder()
 
         # Initialize the session
         await self._initialize()
         logger.info(f"Successfully started MCP server: {self.server_name}")
+
+    def _start_stderr_forwarder(self):
+        """Read subprocess stderr in a daemon thread and forward to parent logger.
+
+        Without this, logs from inside MCP server subprocesses never reach HF
+        Space logs — HF only captures the parent Gradio process's output.
+        """
+        proc = self.process
+        name = self.server_name
+
+        def _pump():
+            try:
+                for line in iter(proc.stderr.readline, ""):
+                    if not line:
+                        break
+                    logger.info(f"[{name}] {line.rstrip()}")
+            except Exception as e:
+                logger.warning(f"[{name}] stderr forwarder stopped: {e}")
+
+        t = threading.Thread(target=_pump, name=f"mcp-stderr-{name}", daemon=True)
+        t.start()
 
     async def _initialize(self):
         """Initialize the MCP session"""
