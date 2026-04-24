@@ -2032,7 +2032,22 @@ async def main() -> None:
         logger.info("Cleaning up resources...")
         await cleanup_mcp_servers()
 
+def _handle_sigterm(signum, frame):
+    """Translate SIGTERM into KeyboardInterrupt so the graceful cleanup path runs.
+
+    HF Spaces sends SIGTERM on Restart/rebuild. Python does NOT convert SIGTERM
+    to KeyboardInterrupt automatically, so without this the process just dies
+    and cleanup_mcp_servers() (which flushes chroma_db to the Dataset repo)
+    never gets the chance to run.
+    """
+    import signal as _signal
+    logger.info(f"Received signal {signum} — initiating graceful shutdown")
+    raise KeyboardInterrupt()
+
+
 if __name__ == "__main__":
+    import signal
+    signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
