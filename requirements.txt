@@ -2,7 +2,7 @@
 # REQUIRES PYTHON 3.10+ (Recommended: Python 3.12)
 # Compatible with Gradio 5.x and 6.x
 gradio==6.12.0
-anthropic>=0.34.0
+anthropic>=1.0,<2  # Pin major: 1.0 removed temperature/top_p/top_k and moved to httpx2
 mcp>=1.21.2  # FastMCP API required
 httpx>=0.25.0
 

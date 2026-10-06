@@ -9,8 +9,24 @@ import logging
 import asyncio
 import httpx
 from typing import AsyncGenerator, List, Dict, Any, Optional, Tuple
+import anthropic
 from anthropic import AsyncAnthropic
 from dotenv import load_dotenv
+
+# The Anthropic SDK moved from httpx to its fork httpx2 in 1.0, so SDK-raised
+# transport errors are httpx2 types. Catch whichever the installed SDK uses.
+try:
+    import httpx2 as sdk_httpx  # anthropic >= 1.0
+except ImportError:
+    sdk_httpx = httpx  # anthropic 0.x
+
+# Transport-level errors worth retrying. APIConnectionError covers what the SDK
+# wraps; the raw transport errors cover failures raised mid-stream.
+RETRYABLE_NETWORK_ERRORS = (
+    anthropic.APIConnectionError,
+    sdk_httpx.RemoteProtocolError,
+    sdk_httpx.ReadError,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -100,8 +116,7 @@ class UnifiedLLMClient:
         tools: List[Dict] = None,
         system_prompt: str = None,
         model: str = None,
-        max_tokens: int = 8192,
-        temperature: float = 0.7
+        max_tokens: int = 8192
     ) -> AsyncGenerator[Tuple[str, List[Dict], str], None]:
         """
         Stream responses from the LLM with automatic fallback.
@@ -162,7 +177,7 @@ class UnifiedLLMClient:
         if use_anthropic_first and self.primary_client:
             try:
                 async for result in self._stream_anthropic(
-                    messages, tools, system_prompt, model, max_tokens, temperature
+                    messages, tools, system_prompt, model, max_tokens
                 ):
                     yield result
                 return  # Success, exit
@@ -178,7 +193,7 @@ class UnifiedLLMClient:
                     logger.warning(f"Model {model} overloaded, falling back to {fallback_model}")
                     try:
                         async for result in self._stream_anthropic(
-                            messages, tools, system_prompt, fallback_model, max_tokens, temperature
+                            messages, tools, system_prompt, fallback_model, max_tokens
                         ):
                             text, tc, _ = result
                             yield (text, tc, f"Anthropic Claude (fallback: {fallback_model})")
@@ -221,7 +236,7 @@ class UnifiedLLMClient:
                     logger.warning(f"SambaNova failed in cost_optimize mode: {e}, falling back to Anthropic")
                     try:
                         async for result in self._stream_anthropic(
-                            messages, tools, system_prompt, model, max_tokens, temperature
+                            messages, tools, system_prompt, model, max_tokens
                         ):
                             yield result
                         return  # Success, exit
@@ -240,8 +255,7 @@ class UnifiedLLMClient:
         tools: List[Dict],
         system_prompt: str,
         model: str,
-        max_tokens: int,
-        temperature: float
+        max_tokens: int
     ) -> AsyncGenerator[Tuple[str, List[Dict], str], None]:
         """Stream from Anthropic with retry logic"""
 
@@ -266,8 +280,7 @@ class UnifiedLLMClient:
                 stream_params = {
                     "model": model,
                     "max_tokens": max_tokens,
-                    "messages": api_messages,
-                    "temperature": temperature
+                    "messages": api_messages
                 }
 
                 if system_prompt:
@@ -310,7 +323,7 @@ class UnifiedLLMClient:
                     yield (accumulated_text, tool_calls, "Anthropic Claude")
                     return  # Success
 
-            except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            except RETRYABLE_NETWORK_ERRORS as e:
                 last_error = e
                 logger.warning(f"Network error on attempt {attempt + 1}: {e}")
 

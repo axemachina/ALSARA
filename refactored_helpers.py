@@ -22,8 +22,7 @@ async def stream_with_retry(
     max_retries: int = 2,
     model: str = None,
     max_tokens: int = 8192,
-    stream_name: str = "API call",
-    temperature: float = 0.7
+    stream_name: str = "API call"
 ) -> AsyncGenerator[Tuple[str, List[Dict], str], None]:
     """
     Simplified wrapper that delegates to UnifiedLLMClient.
@@ -50,8 +49,7 @@ async def stream_with_retry(
                 tools=tools,
                 system_prompt=system_prompt,
                 model=model,
-                max_tokens=max_tokens,
-                temperature=temperature
+                max_tokens=max_tokens
             ):
                 yield (text, tool_calls, provider)
         finally:
@@ -67,8 +65,7 @@ async def stream_with_retry(
             tools=tools,
             system_prompt=system_prompt,
             model=model,
-            max_tokens=max_tokens,
-            temperature=temperature
+            max_tokens=max_tokens
         ):
             yield (text, tool_calls, provider)
 
