@@ -86,19 +86,26 @@ MEMORY_CLEANUP_INTERVAL = 300  # Cleanup every 5 minutes
 async def cleanup_memory():
     """Periodic memory cleanup task"""
     while True:
+        # Each step is isolated: a failure in one cache must not skip the
+        # others or the gc pass, which is the point of this task.
         try:
-            # Clean up expired cache entries
             tool_cache.cleanup_expired()
-            smart_cache.cleanup() if smart_cache else None
+        except Exception as e:
+            logger.error(f"Error cleaning tool_cache: {e}")
 
-            # Force garbage collection for large cleanups
+        try:
+            if smart_cache:
+                smart_cache.clear_expired()
+        except Exception as e:
+            logger.error(f"Error cleaning smart_cache: {e}")
+
+        try:
             import gc
             collected = gc.collect()
             if collected > 0:
                 logger.debug(f"Memory cleanup: collected {collected} objects")
-
         except Exception as e:
-            logger.error(f"Error during memory cleanup: {e}")
+            logger.error(f"Error during garbage collection: {e}")
 
         await asyncio.sleep(MEMORY_CLEANUP_INTERVAL)
 
