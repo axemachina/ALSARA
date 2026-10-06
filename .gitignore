@@ -97,6 +97,8 @@ archive/
 
 # ── Claude Code local state ─────────────────────────────────────────────────
 .claude/
+claude.md
+CLAUDE.md
 
 # ── Internal notes (not for the public repo) ────────────────────────────────
 NOTES.md
