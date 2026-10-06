@@ -1,0 +1,299 @@
+================================================================================
+ALSARA — CODE REUSE NOTES
+Written 2026-10-06. Audience: you, lifting parts of this into another project.
+================================================================================
+
+SCOPE OF THIS FILE
+------------------
+This file covers ONLY what is broken, dead, or half-finished, plus the
+environment traps that cost real time. It is the stuff you cannot see by
+reading the code, because most of it fails silently.
+
+It deliberately does NOT re-describe the architecture. That already exists and
+is accurate:
+
+  README.md "## Architecture"        - dataflow diagram, the 6 MCP servers
+  README.md "### Custom components"  - per-file technical description
+  README.md "## Known limitations"   - design trade-offs the author chose
+                                       (RAG relevance, persistent storage,
+                                       latency, basic auth, single-agent ceiling)
+
+Read those first. The notes below are the delta.
+
+  !! IGNORE implementation_plan.md. It is a pre-build planning document and is
+     now actively misleading: its "Current Gaps" table marks agentic loops,
+     planning phase, reflection and self-correction as NOT implemented. All of
+     those were built afterwards. It describes a system that no longer exists.
+     (It also lists NCBI Gene + OMIM servers that were never built.)
+
+
+================================================================================
+PART 1 - NOT WORKING / NEVER FINISHED
+================================================================================
+
+1.1  MULTI-PROVIDER LLM FALLBACK (SambaNova) - NEVER IMPLEMENTED
+-----------------------------------------------------------------
+The provider module does not exist and never did. Verified: `llm_providers.py`
+is absent from the working tree, absent from all git history, not gitignored,
+and absent from the deployed Space. It was never written, not lost.
+
+`llm_client.py` imports it inside try/except ImportError, logs a warning, and
+degrades to Anthropic-only. So the app works, but a large amount of code is
+permanently unreachable:
+
+  - USE_FALLBACK_LLM                  env flag, inert
+  - SAMBANOVA_API_KEY                 env flag, inert
+  - LLM_PROVIDER_PREFERENCE=cost_optimize    branch never taken
+  - ENABLE_SMART_ROUTING              never taken
+  - classify_query_complexity()       ~40 lines of keyword routing, dead
+  - fallback_router / stream_with_fallback   dead call path
+  - get_provider_display_name()       SambaNova branches unreachable
+
+ORIGINAL INTENT (reconstructed from the code, for context): it was a hackathon
+submission and SambaNova was a listed sponsor. Three jobs: (a) a free no-key
+path so the app could run with zero Anthropic spend, (b) cost routing, sending
+simple factual queries to free Llama and reserving Claude for research
+synthesis, (c) resilience on Anthropic 429/529. tests/test_sambanova.py shows
+the concrete plan: Llama 3.1 70B for plain inference, stepping up to 405B
+specifically for tool calling. llm_client.py later names "Llama 3.3 70B", so
+the target drifted and then stalled.
+
+WHAT DOES WORK: Anthropic -> Anthropic model fallback. On 429/529/503 the
+client retries, then falls back to ANTHROPIC_FALLBACK_MODEL. That path is live
+and tested.
+
+REUSE: either strip the SambaNova scaffolding or implement a provider against
+it. The skeleton's shape is actually sound - every fallback branch is guarded
+on `fallback_router` being truthy, so a missing provider degrades safely rather
+than crashing. Just don't believe the config flags.
+
+
+1.2  SMART CACHE IS READ BUT NEVER WRITTEN - IT CAN NEVER HIT
+--------------------------------------------------------------
+The cache is checked on every query and nothing ever populates it.
+
+  als_agent_app.py:948   smart_cache.find_similar_cached(message)   <- read, live
+  smart_cache.store()                                  never called from the app
+  prewarm_cache()        the only internal store() caller            never called
+  DEFAULT_PREWARM_QUERIES   imported als_agent_app.py:27, never used (AST-verified)
+
+Symptom you will see in the Space log on every single boot:
+  "smart_cache - INFO - No existing cache file found"
+
+So the query-normalization feature the README highlights ("gene therapy ALS"
+and "ALS gene therapy" folding to one entry) is currently inert. The
+normalizer works fine; there is just nothing to match against.
+
+SECOND TRAP in the same file: store() calls asyncio.create_task() at
+smart_cache.py:170 to persist in the background. That needs a RUNNING event
+loop. Called from async Gradio handlers it is fine; called from sync code it
+raises "RuntimeError: no running event loop" and the write is silently lost
+(you also get a "coroutine was never awaited" warning).
+
+REUSE: normalize_query() / generate_cache_key() are the valuable, portable
+part and they work. The cache LIFECYCLE needs wiring, and wiring it means
+deciding what to cache and for how long. Note the configured TTL is 24h -
+for synthesized medical/research answers that is a staleness decision, not a
+detail. Decide deliberately.
+
+
+1.3  VOICE / ELEVENLABS - SERVER DISABLED, UI STILL PRESENT
+------------------------------------------------------------
+  als_agent_app.py:321   registration commented out, marked "(disabled)"
+
+The MCP server is never started (confirmed in the Space boot log: only
+pubmed, aact, trials_links, fetch, biorxiv start; llamaindex is lazy). But the
+voice UI and its handlers are still live at roughly lines 1656 and 1832-1867,
+plus servers/elevenlabs_server.py and ~8 test files remain in the tree.
+
+It degrades gracefully - the user gets "Voice service not available" labels
+rather than a crash - but it is a dead feature with a live surface.
+
+REUSE: don't copy the voice UI unless you also re-enable and test the server.
+
+
+1.4  TESTS ARE NOT A RUNNABLE SUITE
+------------------------------------
+  tests/test_sambanova.py        imports SambaNovaProvider -> ImportError at collection
+  tests/test_llm_integration.py  imports llm_providers      -> ImportError at collection
+  tests/test_sambanova.py:42     also still passes temperature= (removed from the SDK)
+
+Several files in tests/ are interactive scripts - asyncio.run() plus print()
+for a human to eyeball - rather than pytest assertions. Treat tests/ as sample
+code and manual probes, not as a regression suite. Don't assume green.
+
+
+================================================================================
+PART 2 - FIXED ON 2026-10-06
+Listed because if you copy an OLDER snapshot you will inherit these.
+================================================================================
+
+2.1  anthropic SDK 1.x REMOVED temperature / top_p / top_k
+-----------------------------------------------------------
+This took the whole app down. Every query failed with:
+  TypeError: AsyncMessages.stream() got an unexpected keyword argument 'temperature'
+
+CAUSE: requirements.txt pinned `anthropic>=0.34.0` - unpinned across the major.
+A Space rebuild pulled 1.x, which dropped those parameters from the signatures
+entirely. Nothing in the app had changed.
+
+FIX: delete the parameter; pin `anthropic>=1.0,<2`.
+
+ALSO: this is not just an SDK-signature issue, it is a model issue. Claude
+Opus 4.7 and later return HTTP 400 for ANY request carrying temperature -
+including the default value. So do not reintroduce it. If you genuinely need a
+sampling parameter on an older model that still accepts it, pass it through
+extra_body={"temperature": ...} rather than as a keyword.
+
+LESSON: pin SDK majors. `>=x` across a major version is a time bomb on any
+platform that rebuilds dependencies on its own schedule (HF Spaces does).
+
+
+2.2  THE SAME SDK BUMP SILENTLY KILLED NETWORK RETRIES
+-------------------------------------------------------
+anthropic 1.0 also moved its HTTP layer from `httpx` to the fork `httpx2`.
+llm_client.py caught `except (httpx.RemoteProtocolError, httpx.ReadError)`.
+Those classes are no longer what the SDK raises, so the clause stopped matching
+and the retry/backoff path was dead. No error, no log - retries just never
+happened.
+
+Verified empirically:
+  httpx.RemoteProtocolError is httpx2.RemoteProtocolError          -> False
+  issubclass(anthropic.APIConnectionError, (httpx.RemoteProtocolError,
+                                            httpx.ReadError))      -> False
+
+FIX PATTERN (works on both 0.x and 1.x):
+  catch anthropic.APIConnectionError, plus resolve the transport module at
+  import time: try `import httpx2 as sdk_httpx` / except ImportError fall back
+  to `import httpx as sdk_httpx`. See the top of llm_client.py.
+
+NOTE both httpx and httpx2 end up installed, since the project uses httpx
+directly for its own API calls (PubMed, bioRxiv, etc.). Those are unaffected -
+only objects crossing the SDK boundary care.
+
+LESSON: an exception class in a dependency is part of its API. A dependency
+that re-bases its HTTP layer breaks every `except` clause that names it, and
+breaks them silently.
+
+
+2.3  A TYPO DISABLED PERIODIC GARBAGE COLLECTION
+-------------------------------------------------
+  Space log: "Error during memory cleanup:
+              'SmartCache' object has no attribute 'cleanup'"
+
+cleanup_memory() in als_agent_app.py called smart_cache.cleanup(). The real
+method is clear_expired(). Two things made it worse than a noisy log:
+
+  - SmartCache defines no __bool__ and no __len__, so it is ALWAYS truthy and
+    the `if smart_cache` guard never protected anything.
+  - The AttributeError was raised BEFORE gc.collect() in the same try block, so
+    the garbage collection the task exists for never ran at all - on a
+    RAM-limited cpu-basic Space.
+
+FIX: call the right method, and isolate each step in its own try so one cache
+failing cannot skip the others or the gc pass.
+
+LESSON: a broad try/except around several unrelated steps converts a typo in
+step 2 into the permanent loss of step 3. Isolate, or order by importance.
+
+
+2.4  DEPLOY SCRIPT IGNORED THE PROJECT'S OWN SECRET STORE
+----------------------------------------------------------
+deploy.py read only a cached ~/.cache/huggingface/token, while every other
+secret in the project comes from .env via python-dotenv - and HF_TOKEN was
+already documented in .env.example for chroma_sync.py. Now it calls
+load_dotenv(). Note a token scoped only to the chroma Dataset repo is NOT
+enough to deploy; it needs write on the Space itself.
+
+
+================================================================================
+PART 3 - REUSE TRIAGE
+================================================================================
+
+PORTABLE, DOMAIN-AGNOSTIC, WORKS - take these
+  custom_mcp_client.py       Direct-subprocess JSON-RPC MCP client that
+                             replaces mcp.client.stdio. Written because the
+                             stdlib client silently truncated past 8KB; uses
+                             line-buffered I/O + 60s timeout. Probably the
+                             single most reusable file here.
+  parallel_tool_execution.py asyncio.as_completed instead of gather, so
+                             progress streams as each tool finishes rather
+                             than at the end of the slowest. Generic.
+  shared/http_client.py      Shared AsyncClient with connection limits.
+  chroma_sync.py             Push/pull against an HF Dataset repo to survive an
+                             ephemeral container FS. Generic to HF Spaces.
+  llm_client.py              Retry + model-fallback skeleton, once the
+                             SambaNova scaffolding is stripped (see 1.1).
+
+PORTABLE PATTERN, BIOMEDICAL SPECIFICS - adapt
+  citation_verifier.py       The pattern is fully general and genuinely good:
+                             extract every claimed ID from the model's output,
+                             intersect with the set of IDs that actually
+                             appeared in tool results THIS session, flag the
+                             difference. Deterministic hallucination detection
+                             with zero API cost. Only the ID regexes
+                             (NCT/PMID/DOI) and the HTTP verifiers are
+                             domain-specific.
+  smart_cache.py             normalize_query() / generate_cache_key() only.
+                             See 1.2 before trusting the rest.
+
+ALS-SPECIFIC - do not copy
+  servers/aact_server.py     _INTERVENTION_SYNONYMS table, Haversine proximity
+  servers/clinicaltrials_links.py
+  query_classifier.py        keyword lists
+  the patient-framing system prompt in als_agent_app.py (JARGON/STATISTICS
+                             rules, 4-section template, USER_LOCATION bias)
+
+
+================================================================================
+PART 4 - ENVIRONMENT AND DEPLOYMENT TRAPS
+================================================================================
+
+PYTHON 3.10+ IS REQUIRED. anthropic 1.x hard-requires it. macOS system python
+is 3.9 - a venv built with /usr/bin/python3 silently cannot install the SDK.
+
+PIN SDK MAJORS. See 2.1. This is the single highest-value lesson in this file.
+
+HF SPACES: upload_folder NEVER DELETES. It only adds and updates. Consequences:
+  - Files you later add to IGNORE_PATTERNS are NOT retroactively removed. They
+    sit on the Space forever. This project had claude.md,
+    .claude/settings.local.json and implementation_plan.md published on a
+    PUBLIC Space long after they were excluded from deploys.
+  - To remove something you must delete it explicitly (HfApi.delete_file, or
+    upload_folder's delete_patterns).
+  - Audit what is actually on the Space, don't infer it from your patterns.
+    ALLOW_PATTERNS here includes a bare "*.py", which also ships all 56 files
+    in tests/.
+
+HF SPACES: SQUASHING HISTORY DOES NOT PURGE BLOBS. super_squash_history()
+collapses the refs, so the file stops appearing in any browsable history - but
+old commits remain resolvable by direct SHA and still serve the full content
+until HF garbage-collects on its own schedule. Verified by fetching a
+cache-busted raw URL at an orphaned SHA and getting all 3250 bytes back. The
+same is true of a git force-push on GitHub. If you need bytes genuinely gone,
+delete and recreate the repo, or ask the host to GC.
+
+EVERY WRITE TO THE SPACE REPO RESTARTS THE APP (~60s). Batch your deletes and
+uploads into as few commits as possible. A graceful SIGTERM handler exists and
+works (it flushes chroma_db) - see commit "Fix SIGTERM handling".
+
+SECRETS LIVE IN TWO PLACES AND IT MATTERS. Locally .env (gitignored). On the
+Space, Space Settings secrets - NOT .env, which is never uploaded (it matches
+no ALLOW_PATTERN; this was verified). So the Space can be perfectly healthy
+while local .env is empty or wrong.
+
+.env IS GITIGNORED, SO IT IS NOT BACKED UP. This actually happened during an
+OS migration: .env and ~/.cache/huggingface both vanished, taking every API key
+with them. Keep a durable copy of your secrets somewhere outside the repo.
+
+MODEL IDS IN THIS REPO ARE DATED. Defaults are claude-sonnet-4-5-20250929 with
+claude-sonnet-4-20250514 as the overload fallback. If you reuse llm_client.py,
+move to the current generation (claude-opus-5 / claude-sonnet-5) and remember
+the no-temperature rule from 2.1.
+
+RAG PERSISTENCE NEEDS PAID STORAGE. Covered properly in README "Known
+limitations" - the committed chroma_db/ is only a seed, and without
+CHROMA_DB_PATH + CHROMA_SYNC_REPO + a write-scoped HF_TOKEN, anything indexed
+at runtime is lost on restart. IGNORE_PATTERNS deliberately skips chroma_db/**
+so deploys don't clobber the Space's live copy - keep that if you copy
+deploy.py.
