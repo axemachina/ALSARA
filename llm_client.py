@@ -85,7 +85,10 @@ class UnifiedLLMClient:
                     logger.info("SambaNova fallback configured for automatic failover")
 
             except ImportError:
-                logger.warning("Fallback LLM provider not available")
+                logger.warning(
+                    "SambaNova fallback unavailable: llm_providers.py is not "
+                    "part of this build. Anthropic is the only provider."
+                )
 
                 if not self.primary_client:
                     self._raise_configuration_error()
@@ -95,19 +98,19 @@ class UnifiedLLMClient:
         if self.config["is_hf_space"]:
             raise ValueError(
                 "🚨 No LLM provider configured!\n\n"
-                "Option 1: Add your Anthropic API key as a Space secret:\n"
+                "Add your Anthropic API key as a Space secret:\n"
                 "1. Go to your Space Settings\n"
                 "2. Add secret: ANTHROPIC_API_KEY = your_key\n\n"
-                "Option 2: Enable free SambaNova fallback:\n"
-                "Add secret: USE_FALLBACK_LLM = true"
+                "(USE_FALLBACK_LLM will not help: the SambaNova provider module\n"
+                "llm_providers.py is not part of this build.)"
             )
         else:
             raise ValueError(
                 "No LLM provider configured.\n\n"
-                "Option 1: Add to .env file:\n"
+                "Add to your .env file:\n"
                 "ANTHROPIC_API_KEY=your_api_key_here\n\n"
-                "Option 2: Enable free SambaNova:\n"
-                "USE_FALLBACK_LLM=true"
+                "(USE_FALLBACK_LLM will not help: the SambaNova provider module\n"
+                "llm_providers.py is not part of this build.)"
             )
 
     async def stream(

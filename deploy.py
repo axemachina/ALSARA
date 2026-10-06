@@ -44,6 +44,7 @@ IGNORE_PATTERNS = [
     "venv/**", ".venv/**",
     ".claude/**", ".git/**",
     "NOTES.md", "TODO.md", "implementation_plan.md",
+    "claude.md", "CLAUDE.md",  # agent instructions; the Space is public
     "app.log", "*.log",
     "archive/**", "flagged/**",
     "deploy.py",
