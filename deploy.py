@@ -8,12 +8,21 @@ __pycache__/, .claude/, internal notes, and logs. The Space's existing
 chroma_db stays intact; runtime updates to it flow through the separate
 HF Dataset repo via chroma_sync.py.
 
-Requires a cached HF token (~/.cache/huggingface/token) with WRITE scope
-on the Space. Generate via `huggingface-cli login` if missing.
+Requires an HF token with WRITE scope on the Space, from either:
+  - HF_TOKEN in .env (same variable chroma_sync.py uses), or
+  - a cached login (~/.cache/huggingface/token) via `hf auth login`.
+A fine-grained token scoped only to the chroma Dataset repo is NOT enough —
+it also needs write on the Space itself.
 """
 
 import sys
+from dotenv import load_dotenv
 from huggingface_hub import HfApi
+
+# HF_TOKEN lives in .env alongside the rest of the project's secrets
+# (chroma_sync.py uses the same variable). .env is gitignored and matches
+# no ALLOW_PATTERNS below, so it is never uploaded to the Space.
+load_dotenv()
 
 REPO_ID = "axegameon/ALSARA"
 REPO_TYPE = "space"
